@@ -80,6 +80,7 @@ list_features() {
   printf "  %s\n" "$(bold "Build profiles:")"
   printf "    %s                                        # full (default features)\n" "$0"
   printf "    %s --minimal                              # kernel only (~6.6MB)\n" "$0"
+  printf "    %s --all                                  # every optional feature\n" "$0"
   printf "    %s --minimal --features agent-runtime,channel-discord\n" "$0"
   echo
 }
@@ -254,8 +255,11 @@ Usage: $0 [options]
 Options:
   --prebuilt           Download and install a pre-built binary (default when asked)
   --source             Build from source (skips the pre-built prompt)
-  --preset NAME        Named feature preset: 'minimal' (kernel only, ~6.6MB) or
-                       'full' (default features). Source builds only.
+  --preset NAME        Named feature preset: 'minimal' (kernel only, ~6.6MB),
+                       'full' (default features), or 'all' (every optional
+                       feature). Source builds only.
+  --all                Build from source with every optional feature enabled.
+                       Equivalent to --preset all. Source builds only.
   --minimal            Alias for --preset minimal
   --features X,Y       Select specific features — source only (comma-separated)
   --with-gateway       Force the gateway feature on (overrides preset/feature default)
@@ -274,6 +278,7 @@ Examples:
   $0 --prebuilt                                # download pre-built binary (fast)
   $0 --source                                  # always build from source
   $0 --source --minimal                        # smallest possible binary
+  $0 --source --all                            # every optional feature enabled
   $0 --source --features agent-runtime,channel-discord  # custom feature set
   $0 --skip-onboard                            # install only, configure later
   $0 --prefix /tmp/zc-test --skip-onboard      # isolated test install
@@ -388,6 +393,16 @@ interactive_feature_picker() {
   echo >&2
 
   while :; do
+    # Compute "all" marker: ✓ when every picker feature is selected
+    _all_total=0; _all_sel=0
+    for feat in $picker_features; do
+      _all_total=$((_all_total + 1))
+      case " $selected " in *" $feat "*) _all_sel=$((_all_sel + 1)) ;; esac
+    done
+    _all_mark=" "
+    [ "$_all_total" -gt 0 ] && [ "$_all_sel" -eq "$_all_total" ] && _all_mark="✓"
+    printf "    [%2d] %s %s\n" "0" "$_all_mark" "all — enable every optional feature" >&2
+
     i=1
     for feat in $picker_features; do
       mark=" "
@@ -396,13 +411,22 @@ interactive_feature_picker() {
       i=$((i + 1))
     done
     echo >&2
-    printf "  toggle (e.g. \"1 3 5\"), %s confirm: " "$(bold "Enter to")" >&2
+    printf "  toggle (e.g. \"0\", \"1 3 5\"), %s confirm: " "$(bold "Enter to")" >&2
     read -r choices
     [ -z "$choices" ] && break
     for n in $choices; do
       case "$n" in
         ''|*[!0-9]*) continue ;;
       esac
+      if [ "$n" -eq 0 ]; then
+        # Toggle all: if every feature is already selected, deselect all; otherwise select all
+        if [ "$_all_sel" -eq "$_all_total" ] && [ "$_all_total" -gt 0 ]; then
+          selected=""
+        else
+          selected="$picker_features"
+        fi
+        continue
+      fi
       idx=1
       for feat in $picker_features; do
         if [ "$idx" -eq "$n" ]; then
@@ -463,6 +487,7 @@ PREFIX="$HOME"
 INSTALL_MODE=""   # ""=ask, "prebuilt"=force prebuilt, "source"=force source
 PRESET=""         # ""=unset, "minimal"=alias for --minimal, "full"=default-features
 WITH_GATEWAY=""   # ""=unset (preset/feature default applies), "true"/"false"=explicit toggle
+ALL_FEAT=false    # true = --features ci-all (every optional feature)
 
 # Support legacy env var
 if [ -n "${ZEROCLAW_CARGO_FEATURES:-}" ]; then
@@ -472,15 +497,17 @@ fi
 while [ $# -gt 0 ]; do
   case "$1" in
     --minimal)        MINIMAL=true ;;
+    --all)          ALL_FEAT=true ;;
     --preset)
       if [ $# -lt 2 ]; then
-        die "Missing value for --preset. Expected: --preset minimal|full"
+        die "Missing value for --preset. Expected: --preset minimal|full|all"
       fi
       shift
       case "$1" in
         minimal) PRESET="minimal"; MINIMAL=true ;;
         full)    PRESET="full" ;;
-        *)       die "Unknown preset '$1'. Expected: minimal or full" ;;
+        all)     PRESET="all";  ALL_FEAT=true ;;
+        *)       die "Unknown preset '$1'. Expected: minimal, full, or all" ;;
       esac ;;
     --features)
       if [ $# -lt 2 ]; then
@@ -544,7 +571,8 @@ fi
 # Prebuilt binaries always ship with default features, so any flag that
 # changes the feature set must force a source build.
 if [ "$MINIMAL" = true ] || [ -n "$USER_FEATURES" ] \
-   || [ "$WITH_GATEWAY" = "false" ] || [ "$PRESET" = "full" ]; then
+   || [ "$WITH_GATEWAY" = "false" ] || [ "$PRESET" = "full" ] \
+   || [ "$ALL_FEAT" = true ]; then
   INSTALL_MODE="source"
 fi
 
@@ -683,8 +711,16 @@ esac
 
 CARGO_FLAGS=""
 
+if [ "$ALL_FEAT" = true ] && [ "$MINIMAL" = true ]; then
+  die "--all / --preset all and --minimal are mutually exclusive"
+fi
+
 if [ "$MINIMAL" = true ]; then
   CARGO_FLAGS="--no-default-features"
+fi
+
+if [ "$ALL_FEAT" = true ]; then
+  CARGO_FLAGS="$CARGO_FLAGS --features ci-all"
 fi
 
 # `--without-gateway` overrides the default-features set: switch to
