@@ -111,6 +111,10 @@
   flows (#6168).
 - **Groq:** per-profile `native_tools` override on `ModelProviderConfig`
   (#6380).
+- **Local/self-hosted providers:** new per-profile `max_concurrent` on
+  `ModelProviderConfig` caps in-flight requests against a single provider
+  (e.g. `providers.models.ollama.max_concurrent = 1`) — useful for local
+  Ollama/llama.cpp/vLLM servers that can't handle parallel inference.
 - **StepFun:** new `stepfun-intl` endpoint (#6310).
 - **xAI:** model listing is restored (9bd95a0c9).
 - **OpenAI-compatible:** `tool_call` `extra_content` is preserved so Gemini's

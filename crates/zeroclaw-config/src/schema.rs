@@ -620,6 +620,14 @@ pub struct ModelProviderConfig {
     /// tool calling for Groq models that support it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_tools: Option<bool>,
+    /// Maximum number of concurrent in-flight requests allowed against this
+    /// provider. Useful for self-hosted/local model servers (Ollama,
+    /// llama.cpp, vLLM) that don't have the hardware to serve multiple
+    /// inference requests at once — set this to `1` to serialize all calls
+    /// to that server. Leave unset for cloud providers, which handle their
+    /// own concurrency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<usize>,
 }
 
 // ── Delegate Tool Configuration ─────────────────────────────────

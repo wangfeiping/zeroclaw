@@ -35,6 +35,7 @@ pub mod openai_codex;
 pub mod openrouter;
 pub mod reliable;
 pub mod router;
+pub mod semaphored;
 pub mod telnyx;
 pub mod traits;
 
@@ -47,6 +48,7 @@ pub use traits::{
 use crate::auth::AuthService;
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;
+use semaphored::SemaphoredProvider;
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -725,6 +727,11 @@ pub struct ProviderRuntimeOptions {
     /// `ModelProviderConfig::native_tools`. Currently consulted only by the
     /// Groq factory branch (#5932).
     pub native_tools: Option<bool>,
+    /// Maximum concurrent in-flight requests allowed against the provider
+    /// being constructed. `None` means unlimited (the historical default).
+    /// Propagated from `ModelProviderConfig::max_concurrent` — set this for
+    /// local/self-hosted model servers that can't handle parallel inference.
+    pub max_concurrent: Option<usize>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -743,6 +750,7 @@ impl Default for ProviderRuntimeOptions {
             merge_system_into_user: false,
             provider_extra: None,
             native_tools: None,
+            max_concurrent: None,
         }
     }
 }
@@ -787,6 +795,7 @@ pub fn provider_runtime_options_from_config(
         merge_system_into_user,
         provider_extra: fallback.and_then(|e| e.provider_extra.clone()),
         native_tools: fallback.and_then(|e| e.native_tools),
+        max_concurrent: fallback.and_then(|e| e.max_concurrent),
     }
 }
 
@@ -1210,7 +1219,7 @@ fn create_provider_with_url_and_options(
         }
     }
 
-    match name {
+    let provider: anyhow::Result<Box<dyn Provider>> = match name {
         "openai-codex" | "openai_codex" | "codex" => {
             let mut codex_options = options.clone();
             codex_options.provider_api_url = api_url
@@ -1797,7 +1806,13 @@ fn create_provider_with_url_and_options(
              Tip: Use \"custom:https://your-api.com\" for OpenAI-compatible endpoints.\n\
              Tip: Use \"anthropic-custom:https://your-api.com\" for Anthropic-compatible endpoints."
         ),
-    }
+    };
+    let provider = provider?;
+
+    Ok(match options.max_concurrent {
+        Some(limit) => Box::new(SemaphoredProvider::new(provider, limit)),
+        None => provider,
+    })
 }
 
 /// Parse `"provider:profile"` syntax for fallback entries.
