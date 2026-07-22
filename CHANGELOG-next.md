@@ -114,7 +114,11 @@
 - **Local/self-hosted providers:** new per-profile `max_concurrent` on
   `ModelProviderConfig` caps in-flight requests against a single provider
   (e.g. `providers.models.ollama.max_concurrent = 1`) — useful for local
-  Ollama/llama.cpp/vLLM servers that can't handle parallel inference.
+  Ollama/llama.cpp/vLLM servers that can't handle parallel inference. When
+  set, every call against that provider is logged at WARN with the
+  provider/endpoint, model, and call parameters (message/tool counts,
+  temperature, streaming) so throttled traffic stays visible without
+  raising global log verbosity.
 - **StepFun:** new `stepfun-intl` endpoint (#6310).
 - **xAI:** model listing is restored (9bd95a0c9).
 - **OpenAI-compatible:** `tool_call` `extra_content` is preserved so Gemini's

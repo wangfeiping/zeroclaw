@@ -1,4 +1,4 @@
-# 开发报告：本地模型 Provider 并发限流（`max_concurrent`）
+# 开发报告：本地模型 Provider 并发限流（`max_concurrent`）+ 调用日志
 
 版本: v0.7.5-a（dev-v0.7.5 分支）　日期: 2026-07-22
 
@@ -50,6 +50,22 @@ pub max_concurrent: Option<usize>,
 - `max_concurrent = 0` 会被当作 `1` 处理，防止把 Provider 意外锁死为完全不可用。
 - 其余不涉及网络 I/O 的元数据方法（`capabilities`、`default_temperature`、
   `convert_tools` 等）直接透传给内部 Provider，不经过信号量。
+
+**调用日志（本轮新增）**：`SemaphoredProvider` 内部保存一个 `provider_label`
+（Provider 名 + 自定义 base_url，例如 `ollama (http://localhost:11434)`），并在每次
+真正发起推理请求前（`chat_with_system` / `chat_with_history` / `chat` /
+`chat_with_tools` 及三个流式方法）调用 `tracing::warn!` 打一条结构化日志，字段包括：
+
+- `provider`：Provider 标识（名称 + 端点）
+- `api`：具体调用的方法名（如 `chat_with_history`）
+- `model`：本次请求使用的模型
+- `temperature`：采样温度
+- `message_count` / `tool_count`：消息数、工具数
+- `streaming`：是否走流式接口
+
+由于 `SemaphoredProvider` 只在配置了 `max_concurrent` 时才会被构造并包裹到 Provider
+外面，所以这条 WARN 日志天然只在"启用了并发限流"的 Provider 上生效，不需要额外开关；
+`list_models`/`warmup` 这类非对话调用不打这条日志（不涉及 model/参数，噪音大于价值）。
 
 ### 3. `crates/zeroclaw-providers/src/lib.rs`
 
@@ -113,18 +129,21 @@ fallback"这种典型场景是够用的；如果之后要支持"每条路由各�
 
 ## 五、测试验证
 
-新增单元测试（`crates/zeroclaw-providers/src/semaphored.rs`）：
+单元测试（`crates/zeroclaw-providers/src/semaphored.rs`）：
 
 - `caps_concurrent_chat_calls`：并发发起 5 个请求，验证任意时刻同时在跑的请求数不超过
   配置的上限。
 - `zero_max_concurrent_is_treated_as_one`：验证 `max_concurrent = 0` 被安全地当作 `1`
   处理。
+- `max_concurrent_call_is_logged_at_warn`（本轮新增）：手写一个极简 `tracing::Subscriber`
+  （不引入 `tracing-subscriber` 额外依赖）捕获事件，验证一次 `chat_with_system` 调用
+  确实触发且仅触发一条 `Level::WARN` 事件，消息包含 "AI API call"。
 
-全量回归测试结果（`cargo clean` 后从零重新编译）：
+全量回归测试结果：
 
 | Crate | 结果 |
 |---|---|
-| zeroclaw-providers | 809 passed, 0 failed |
+| zeroclaw-providers | 810 passed, 0 failed（含日志功能新增的 1 个测试） |
 | zeroclaw-channels | 1224 passed, 0 failed |
 | zeroclaw-config | 620 passed, 0 failed |
 | zeroclaw-gateway | 171 passed, 0 failed |
@@ -132,15 +151,20 @@ fallback"这种典型场景是够用的；如果之后要支持"每条路由各�
 | zeroclawlabs（主二进制 + acp-bridge） | 237 + 236 + 18 passed, 0 failed |
 
 `cargo fmt --check` 通过。`apps/tauri`（桌面端）未纳入验证——该 crate 在本机环境本来就
-因缺少系统库 `libsoup-3.0` 无法编译，与本次改动无关。
+因缺少系统库 `libsoup-3.0` 无法编译，与本次改动无关。日志功能改动只涉及
+`zeroclaw-providers` 内部（`SemaphoredProvider::new` 的唯一调用方就是同 crate 的工厂
+函数），未影响下游 crate 的公开接口。
 
 ---
 
 ## 六、变更文件清单
 
+`max_concurrent` 基础功能已由用户在 `4fe968bd8` 提交（"增加max_concurrent 配置项..."）。
+本轮调用日志功能在其基础上追加，尚未提交：
+
 ```
- CHANGELOG-next.md                       |  4 ++++
- crates/zeroclaw-config/src/schema.rs    |  8 ++++++++
- crates/zeroclaw-providers/src/lib.rs    | 19 +++++++++++++++++--
- crates/zeroclaw-providers/src/semaphored.rs (新增)
+ CHANGELOG-next.md                           |  6 +-
+ README_UPDATE.md                            | 31 ++++-
+ crates/zeroclaw-providers/src/lib.rs        |  8 +-
+ crates/zeroclaw-providers/src/semaphored.rs | 154 ++++++++++++++++++-
 ```

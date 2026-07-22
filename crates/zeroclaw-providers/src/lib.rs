@@ -1810,7 +1810,13 @@ fn create_provider_with_url_and_options(
     let provider = provider?;
 
     Ok(match options.max_concurrent {
-        Some(limit) => Box::new(SemaphoredProvider::new(provider, limit)),
+        Some(limit) => {
+            let provider_label = match api_url.map(str::trim).filter(|url| !url.is_empty()) {
+                Some(url) => format!("{name} ({url})"),
+                None => name.to_string(),
+            };
+            Box::new(SemaphoredProvider::new(provider, limit, provider_label))
+        }
         None => provider,
     })
 }
