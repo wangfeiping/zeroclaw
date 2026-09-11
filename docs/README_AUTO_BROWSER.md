@@ -20,7 +20,8 @@ agent-browser install --with-deps
   agent-browser --profile "$HOME/.agent-browser-discord-profile" --args "--no-sandbox" --session discord \
     open https://discord.com/login
 
-  *** 注意：上面命令会显示成功信息，但没有打开浏览器（因为无头模式），需要登录并连接、导出cookies
+  *** 注意（如果没有显示器）：上面命令会显示成功信息，但没有打开浏览器（因为无头模式），需要登录并连接、导出cookies
+  ***     需要安装虚拟显示
 
   # 1. 起一个带调试端口、已登录的 Chrome（后台运行）
   "$HOME/.agent-browser/browsers/chrome-153.0.8010.36/chrome" \
@@ -149,4 +150,67 @@ Claude:
   - crates/zeroclaw-tools/src/browser_delegate.rs — 复用本机 Chrome profile
   - docs/book/src/tools/browser.md — 官方文档
   - docs/README_AUTO_BROWSER.md — 中文调试笔记，专门讨论过 Discord 登录态与 session 场景，跟你的问题高度对应，建议直接看一下
+
+## Question 3
+
+```text
+就是说agent-browser永远不可能实际打开一个浏览器，必须通过别的方法创建并导出cookies才行是么？
+
+```
+
+Claude:
+
+● 不完全对，需要澄清一下：
+
+  agent-browser 本身是可以打开真实浏览器窗口的——加 --headed 参数就会显示交互式窗口（README 里明确写着 --headed | Show browser window on the interactive desktop），不是"永远不可能"。
+
+  问题在于：远程服务器通常没有图形显示环境（没有 X11/Wayland/桌面）。--headed 依赖一个真实或虚拟的显示服务器才能弹出窗口——服务器上没有
+  DISPLAY，这个参数自然用不了，你就没法用肉眼登录、过验证码/二次验证。这不是 agent-browser 的限制，是"远程无图形界面服务器"这个环境本身的限制。
+
+  所以实际上有两条路，不是只有导出 cookie 一条：
+
+  1. 导出 cookie 导入（你笔记里用的方法）：在有图形界面的机器（比如你本地电脑）上用真实 Chrome 交互登录一次，导出 cookie，传到服务器上导入到 --session discord 的 headless profile 里。
+  2. 给服务器装一个虚拟显示环境（docs/book/src/tools/browser.md 里专门讲过）：装 Xvfb（虚拟帧缓冲）模拟一块"屏幕"，再配合 VNC 把这块虚拟屏幕转发出来，你就能远程"看到"并操作 --headed
+     模式下真正弹出的浏览器窗口，在服务器本地完成交互登录（含验证码/2FA），不需要来回搬运 cookie。
+
+  两种方法各有取舍：cookie 导入更轻量、不用额外装 Xvfb/VNC，但每次登录态失效都要重新走一遍导出导入；Xvfb+VNC
+  装好后可以直接在服务器上交互操作，但环境搭建更重。你笔记里选的是前者，属于合理的工作方式选择，而不是 agent-browser 技术上做不到"打开真实浏览器"。
+
+## Question 4
+
+```text
+远程服务器也有显示器
+
+```
+
+Claude:
+
+● 如果服务器上确实接了显示器并且有人登录了图形桌面（不是纯 SSH 无头环境），那 --headed 大概率是可以直接用的，不需要绕过 cookie 导出这条路。关键要确认两点：
+
+  1. 物理屏幕上是否真的有一个桌面会话在跑（有人登录了 GNOME/KDE/XFCE 等，而不是屏幕接着但一直停在登录界面/黑屏）——这决定了背后是否存在一个活的 X11/Wayland server。
+  2. 你执行 agent-browser 命令的那个 shell 能不能连上那个显示会话——如果你是通过 SSH 远程登录去敲命令，SSH session 默认不会自动拿到物理控制台那个桌面的 DISPLAY，需要手动指定：
+
+  # 先在服务器本地（或已知桌面会话）确认显示编号和权限
+  echo $DISPLAY          # 桌面会话本身跑起来后，在它自己的终端里执行能看到，比如 :0 或 :1
+  who                     # 看谁登录了图形会话
+  loginctl show-session $(loginctl | awk '/tty|seat/{print $1; exit}') -p Type 2>/dev/null
+
+  # 在 SSH 里手动指定同一个 DISPLAY 并给权限
+  xhost +local:           # 在物理桌面会话的终端里执行一次，允许本地连接
+  export DISPLAY=:0       # 在 SSH 会话里设置成和桌面会话一致的编号
+  export XAUTHORITY=/home/<桌面登录用户>/.Xauthority   # 通常需要这个才能鉴权成功
+
+  # 测试能不能连上
+  xdotool getactivewindow 2>&1   # 或者装了 xrandr 的话: xrandr
+
+  确认这几步通了之后，直接加 --headed 试：
+
+  agent-browser --profile "$HOME/.agent-browser-discord-profile" --args "--no-sandbox" \
+      --session discord --headed \
+      open https://discord.com/login
+
+  如果这样能看到浏览器窗口真的弹在那块屏幕上，你就可以直接在服务器上完成交互登录（含验证码/2FA），不再需要"本地登录导出 cookie
+  再导入"这套流程了——那套流程本来就是为纯无头、没有任何显示手段的服务器准备的备用方案，不是必经之路。
+
+  如果 --headed 试了没反应或报连接显示服务器失败，把具体报错发我，我再帮你继续查是权限问题还是压根没有桌面会话在跑。
 
