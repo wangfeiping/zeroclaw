@@ -20,14 +20,14 @@ agent-browser install --with-deps
   agent-browser --profile "$HOME/.agent-browser-discord-profile" --args "--no-sandbox" --session discord \
     open https://discord.com/login
 
-  DISPLAY=:99 google-chrome --no-sandbox --user-data-dir=$HOME/.agent-browser-discord-profile https://discord.com/login
+  *** 注意：上面命令会显示成功信息，但没有打开浏览器（因为无头模式），需要登录并连接、导出cookies
 
   # 1. 起一个带调试端口、已登录的 Chrome（后台运行）
   "$HOME/.agent-browser/browsers/chrome-153.0.8010.36/chrome" \
     --no-sandbox \
     --user-data-dir="$HOME/.agent-browser-discord-profile" \
     --remote-debugging-port=9222 \
-    https://discord.com/channels/491685925227724801/999575963920781382 &
+    https://discord.com/login &
  
   sleep 2
   
@@ -50,6 +50,7 @@ agent-browser install --with-deps
 
   把第 2 步 cat 的内容（条数/是否有 discord.com 相关 cookie，比如 token 之类的名字，具体值不用贴）和第 5 步截图结果告诉我。
 
+  DISPLAY=:99 google-chrome --no-sandbox --user-data-dir=$HOME/.agent-browser-discord-profile https://discord.com/login
 ```
 
 ## Question 1
