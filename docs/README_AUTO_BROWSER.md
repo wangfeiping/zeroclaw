@@ -7,11 +7,20 @@
 ulimit -n
 ulimit -n 65535
 
-DISPLAY=:99 google-chrome --no-sandbox --user-data-dir=$HOME/.agent-browser-discord-profile https://discord.com/login
+sudo vi /etc/security/limits.conf
+* soft nofile 65535
+* hard nofile 65535
+
+# 安装agent-browser 和chrome
+npm install -g agent-browser
+agent-browser install --with-deps
 
 ### 正确参数调用
-agent-browser --profile "$HOME/.agent-browser-discord-profile" --args "--no-sandbox" --session discord                                                                                      
-  open https://discord.com/channels/491685925227724801/999575963920781382
+
+  agent-browser --profile "$HOME/.agent-browser-discord-profile" --args "--no-sandbox" --session discord \
+    open https://discord.com/login
+
+  DISPLAY=:99 google-chrome --no-sandbox --user-data-dir=$HOME/.agent-browser-discord-profile https://discord.com/login
 
   # 1. 起一个带调试端口、已登录的 Chrome（后台运行）
   "$HOME/.agent-browser/browsers/chrome-153.0.8010.36/chrome" \
