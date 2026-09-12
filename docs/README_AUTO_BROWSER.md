@@ -15,6 +15,8 @@ sudo vi /etc/security/limits.conf
 npm install -g agent-browser
 agent-browser install --with-deps
 
+# *** 注意：也要安装正式版本的chrome，否则可能在agent-browser操作时看不到浏览器 ***
+
 ### 正确参数调用
 
   agent-browser --profile "$HOME/.agent-browser-discord-profile" --args "--no-sandbox" --session discord \
@@ -52,6 +54,10 @@ agent-browser install --with-deps
   把第 2 步 cat 的内容（条数/是否有 discord.com 相关 cookie，比如 token 之类的名字，具体值不用贴）和第 5 步截图结果告诉我。
 
   DISPLAY=:99 google-chrome --no-sandbox --user-data-dir=$HOME/.agent-browser-discord-profile https://discord.com/login
+
+  DISPLAY=:99 agent-browser --profile "$HOME/.agent-browser-discord-profile" --args "--no-sandbox" \
+    --session discord --headed \
+    open https://x.com/home
 ```
 
 ## Question 1
