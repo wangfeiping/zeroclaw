@@ -13,5 +13,5 @@ version:
 #
 # Binaries will most likely be found in `./target/release`
 install: version
-	install.sh --source --preset all
+	./install.sh --source --preset all
 
