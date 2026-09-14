@@ -1,5 +1,12 @@
 //! Channel implementations and orchestration for messaging platform integrations.
 
+// matrix-sdk's deeply nested #[instrument]-wrapped async call chain (sync ->
+// receive_sync_response -> ... -> decrypt_olm_v1) pushes the compiler's Send
+// auto-trait solving past the default recursion limit on some rustc versions
+// when `channel-matrix` is enabled. Raise it rather than fight matrix-sdk's
+// internals.
+#![recursion_limit = "256"]
+
 pub mod orchestrator;
 pub mod util;
 
