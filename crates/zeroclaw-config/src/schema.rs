@@ -2802,6 +2802,12 @@ pub struct BrowserConfig {
     /// Headless mode for rust-native backend
     #[serde(default = "default_true")]
     pub native_headless: bool,
+    /// Run the `agent_browser` backend in headed (visible window) mode instead
+    /// of headless. Requires a reachable display (e.g. Xvfb + `DISPLAY`).
+    /// Some sites (Cloudflare-protected pages, ChatGPT, etc.) block headless
+    /// browser fingerprints; headed mode passes these checks more reliably.
+    #[serde(default)]
+    pub agent_browser_headed: bool,
     /// WebDriver endpoint URL for rust-native backend (e.g. `http://127.0.0.1:9515`)
     #[serde(default = "default_browser_webdriver_url")]
     pub native_webdriver_url: String,
@@ -2834,6 +2840,7 @@ impl Default for BrowserConfig {
             session_name: None,
             backend: default_browser_backend(),
             native_headless: default_true(),
+            agent_browser_headed: false,
             native_webdriver_url: default_browser_webdriver_url(),
             native_chrome_path: None,
             computer_use: BrowserComputerUseConfig::default(),
@@ -14395,6 +14402,7 @@ default_temperature = 0.7
             session_name: None,
             backend: "auto".into(),
             native_headless: false,
+            agent_browser_headed: true,
             native_webdriver_url: "http://localhost:4444".into(),
             native_chrome_path: Some("/usr/bin/chromium".into()),
             computer_use: BrowserComputerUseConfig {
@@ -14414,6 +14422,7 @@ default_temperature = 0.7
         assert_eq!(parsed.allowed_domains[0], "example.com");
         assert_eq!(parsed.backend, "auto");
         assert!(!parsed.native_headless);
+        assert!(parsed.agent_browser_headed);
         assert_eq!(parsed.native_webdriver_url, "http://localhost:4444");
         assert_eq!(
             parsed.native_chrome_path.as_deref(),

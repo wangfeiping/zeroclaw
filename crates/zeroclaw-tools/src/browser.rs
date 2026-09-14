@@ -63,6 +63,7 @@ pub struct BrowserTool {
     allowed_domains: Vec<String>,
     session_name: Option<String>,
     backend: String,
+    agent_browser_headed: bool,
     #[allow(dead_code)] // read only with browser-native feature
     native_headless: bool,
     #[allow(dead_code)]
@@ -210,6 +211,7 @@ impl BrowserTool {
             allowed_domains,
             session_name,
             "agent_browser".into(),
+            false,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -223,6 +225,7 @@ impl BrowserTool {
         allowed_domains: Vec<String>,
         session_name: Option<String>,
         backend: String,
+        agent_browser_headed: bool,
         native_headless: bool,
         native_webdriver_url: String,
         native_chrome_path: Option<String>,
@@ -233,6 +236,7 @@ impl BrowserTool {
             allowed_domains: normalize_domains(allowed_domains),
             session_name,
             backend,
+            agent_browser_headed,
             native_headless,
             native_webdriver_url,
             native_chrome_path,
@@ -462,6 +466,23 @@ impl BrowserTool {
         // HOME which browsers need for profile directories.
         if is_service_environment() {
             ensure_browser_env(&mut cmd);
+        }
+
+        // Chrome's initial (cold-start) launch needs --no-sandbox passed as a
+        // CLI flag: agent-browser's auto-launch path does not consult
+        // AGENT_BROWSER_ARGS (or any other env var), only the `--args` flag
+        // on that specific invocation. Whether the sandbox is usable is a
+        // property of the host kernel (e.g. AppArmor's unprivileged-userns
+        // restriction on Ubuntu 23.10+), not of "is this a service" — so
+        // this is applied unconditionally rather than gated behind
+        // is_service_environment(), which only covers systemd/OpenRC.
+        cmd.arg("--args").arg("--no-sandbox,--disable-dev-shm-usage");
+
+        // Some sites (Cloudflare-protected pages, ChatGPT, etc.) fingerprint
+        // and block headless browsers. Headed mode requires a reachable
+        // display (e.g. Xvfb + DISPLAY) but passes these checks reliably.
+        if self.agent_browser_headed {
+            cmd.arg("--headed");
         }
 
         // Add session if configured
@@ -2171,14 +2192,17 @@ fn ensure_browser_env(cmd: &mut Command) {
     if std::env::var_os("HOME").is_none() {
         cmd.env("HOME", "/tmp");
     }
-    let existing = std::env::var("CHROMIUM_FLAGS").unwrap_or_default();
+    // agent-browser reads `AGENT_BROWSER_ARGS` (comma/newline-separated Chrome
+    // launch args), not `CHROMIUM_FLAGS` — that's a Debian/Ubuntu chromium-browser
+    // wrapper-script convention that agent-browser's bundled Chrome never reads.
+    let existing = std::env::var("AGENT_BROWSER_ARGS").unwrap_or_default();
     if !existing.contains("--no-sandbox") {
         let new_flags = if existing.is_empty() {
-            "--no-sandbox --disable-dev-shm-usage".to_string()
+            "--no-sandbox,--disable-dev-shm-usage".to_string()
         } else {
-            format!("{existing} --no-sandbox --disable-dev-shm-usage")
+            format!("{existing},--no-sandbox,--disable-dev-shm-usage")
         };
-        cmd.env("CHROMIUM_FLAGS", new_flags);
+        cmd.env("AGENT_BROWSER_ARGS", new_flags);
     }
 }
 
@@ -2366,6 +2390,7 @@ mod tests {
             vec!["example.com".into()],
             None,
             "auto".into(),
+            false,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2382,6 +2407,7 @@ mod tests {
             vec!["example.com".into()],
             None,
             "computer_use".into(),
+            false,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2401,6 +2427,7 @@ mod tests {
             vec!["example.com".into()],
             None,
             "computer_use".into(),
+            false,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2421,6 +2448,7 @@ mod tests {
             vec!["example.com".into()],
             None,
             "computer_use".into(),
+            false,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2442,6 +2470,7 @@ mod tests {
             vec!["example.com".into()],
             None,
             "computer_use".into(),
+            false,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2575,7 +2604,7 @@ mod tests {
 
         let mut cmd = Command::new("true");
         ensure_browser_env(&mut cmd);
-        // Function completes without panic — HOME and CHROMIUM_FLAGS set on cmd.
+        // Function completes without panic — HOME and AGENT_BROWSER_ARGS set on cmd.
 
         if let Some(home) = original_home {
             unsafe { std::env::set_var("HOME", home) };
@@ -2583,15 +2612,15 @@ mod tests {
     }
 
     #[test]
-    fn ensure_browser_env_sets_chromium_flags() {
-        let original = std::env::var_os("CHROMIUM_FLAGS");
-        unsafe { std::env::remove_var("CHROMIUM_FLAGS") };
+    fn ensure_browser_env_sets_agent_browser_args() {
+        let original = std::env::var_os("AGENT_BROWSER_ARGS");
+        unsafe { std::env::remove_var("AGENT_BROWSER_ARGS") };
 
         let mut cmd = Command::new("true");
         ensure_browser_env(&mut cmd);
 
         if let Some(val) = original {
-            unsafe { std::env::set_var("CHROMIUM_FLAGS", val) };
+            unsafe { std::env::set_var("AGENT_BROWSER_ARGS", val) };
         }
     }
 

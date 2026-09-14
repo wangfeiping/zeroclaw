@@ -1,0 +1,23 @@
+[Unit]
+Description=ZeroClaw daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/mil2er/.cargo/bin/zeroclaw daemon
+Restart=always
+RestartSec=3
+# Ensure HOME is set so headless browsers can create profile/cache dirs.
+Environment=HOME=%h
+Environment=AGENT_BROWSER_ARGS=--no-sandbox,--disable-dev-shm-usage
+# 让 daemon 永不因为空闲而自动退出，预热一次之后就一直活着
+Environment=AGENT_BROWSER_IDLE_TIMEOUT_MS=0
+# 服务启动后，用完全正确的交互式方式预热一次 daemon
+ExecStartPost=/bin/sh -c 'sleep 2; /home/mil2er/.nvm/versions/node/v24.13.1/bin/agent-browser open || true'
+# Allow inheriting DISPLAY and XDG_RUNTIME_DIR from the user session
+# so graphical/headless browsers can function correctly.
+PassEnvironment=DISPLAY XDG_RUNTIME_DIR
+
+[Install]
+WantedBy=default.target
+
