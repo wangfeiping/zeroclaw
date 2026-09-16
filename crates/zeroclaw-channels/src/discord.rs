@@ -1152,6 +1152,9 @@ impl Channel for DiscordChannel {
 
                     // Only handle MESSAGE_CREATE (opcode 0, type "MESSAGE_CREATE")
                     let event_type = event.get("t").and_then(|t| t.as_str()).unwrap_or("");
+                    if !event_type.is_empty() {
+                        tracing::info!("Discord: gateway dispatch event t={event_type}");
+                    }
                     if event_type != "MESSAGE_CREATE" {
                         continue;
                     }
