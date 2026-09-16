@@ -1,18 +1,23 @@
-import { Routes, Route, Navigate } from 'react-router-dom';
-import { useState, useEffect, createContext, useContext } from 'react';
-import Layout from './components/layout/Layout';
-import Dashboard from './pages/Dashboard';
-import AgentChat from './pages/AgentChat';
-import Tools from './pages/Tools';
-import Cron from './pages/Cron';
-import Integrations from './pages/Integrations';
-import Memory from './pages/Memory';
-import Config from './pages/Config';
-import Cost from './pages/Cost';
-import Logs from './pages/Logs';
-import Doctor from './pages/Doctor';
-import { AuthProvider, useAuth } from './hooks/useAuth';
-import { setLocale, type Locale } from './lib/i18n';
+import {
+  Component,
+  createContext,
+  useContext,
+  useEffect,
+  useState,
+  type ErrorInfo,
+  type ReactNode,
+} from "react";
+import { useLocation, useNavigate } from "react-router-dom";
+import { ThemeProvider } from "./contexts/ThemeContext";
+
+import { loadLocale, saveLocale } from "./contexts/ThemeContext";
+import { AuthProvider, useAuth } from "./hooks/useAuth";
+import { DraftContext, useDraftStore } from "./hooks/useDraft";
+import { getAdminPairCode, generatePairCode, PairCodeForbiddenError, getQuickstartState } from "./lib/api";
+import { basePath } from "./lib/basePath";
+import { ConfigDraftProvider } from "./lib/draftStore";
+import { setLocale, type Locale } from "./lib/i18n";
+import { Router } from "./router/router";
 
 // Locale context
 interface LocaleContextType {
@@ -21,57 +26,344 @@ interface LocaleContextType {
 }
 
 export const LocaleContext = createContext<LocaleContextType>({
-  locale: 'tr',
+  locale: "en",
   setAppLocale: () => {},
 });
 
 export const useLocaleContext = () => useContext(LocaleContext);
 
+// ---------------------------------------------------------------------------
+// Error boundary — catches render crashes and shows a recoverable message
+// instead of a black screen
+// ---------------------------------------------------------------------------
+
+interface ErrorBoundaryState {
+  error: Error | null;
+}
+
+export class ErrorBoundary extends Component<
+  { children: ReactNode },
+  ErrorBoundaryState
+> {
+  constructor(props: { children: ReactNode }) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { error };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error("[ZeroClaw] Render error:", error, info.componentStack);
+    // Stale-chunk recovery: when Vite rebuilds, the loaded index.html
+    // still references the previous chunk hashes. A dynamic import for
+    // a lazy route then 404s with "error loading dynamically imported
+    // module". Reload once so the user gets the new index.html and the
+    // current chunk hashes; the sessionStorage marker prevents reload
+    // loops if reload doesn't actually help.
+    if (
+      isChunkLoadError(error) &&
+      !sessionStorage.getItem("zeroclaw-chunk-reloaded")
+    ) {
+      sessionStorage.setItem("zeroclaw-chunk-reloaded", "1");
+      window.location.reload();
+    }
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="p-6">
+          <div
+            className="card p-6 w-full max-w-lg"
+            style={{ borderColor: "var(--color-status-error-alpha-30)" }}
+          >
+            <h2
+              className="text-lg font-semibold mb-2"
+              style={{ color: "var(--color-status-error)" }}
+            >
+              Something went wrong
+            </h2>
+            <p
+              className="text-sm mb-4"
+              style={{ color: "var(--pc-text-muted)" }}
+            >
+              A render error occurred. Check the browser console for details.
+            </p>
+            <pre
+              className="text-xs rounded-lg p-3 overflow-x-auto whitespace-pre-wrap break-all font-mono"
+              style={{
+                background: "var(--pc-bg-base)",
+                color: "var(--color-status-error)",
+              }}
+            >
+              {this.state.error.message}
+            </pre>
+            <button
+              onClick={() => {
+                sessionStorage.removeItem("zeroclaw-chunk-reloaded");
+                this.setState({ error: null });
+              }}
+              className="btn-electric mt-6 px-4 py-2 text-sm font-medium"
+            >
+              Try again
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+function isChunkLoadError(error: Error): boolean {
+  const m = error?.message ?? "";
+  return (
+    m.includes("dynamically imported module") ||
+    m.includes("Failed to fetch dynamically") ||
+    m.includes("Importing a module script failed") ||
+    error?.name === "ChunkLoadError"
+  );
+}
+
 // Pairing dialog component
-function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) {
-  const [code, setCode] = useState('');
-  const [error, setError] = useState('');
+function PairingDialog({
+  onPair,
+}: {
+  onPair: (code: string) => Promise<void>;
+}) {
+  const [code, setCode] = useState("");
+  const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [displayCode, setDisplayCode] = useState<string | null>(null);
+  const [codeLoading, setCodeLoading] = useState(true);
+  const [generating, setGenerating] = useState(false);
+  // True once minting from the browser is impossible (remote/non-loopback origin,
+  // a 403, or pairing disabled) — collapse to the copy-able CLI command instead.
+  const [showCliFallback, setShowCliFallback] = useState(false);
+
+  // The admin mint endpoint is localhost-only, so a self-serve "Generate" button
+  // can only work when the dashboard itself is served from loopback. Remote /
+  // Docker origins must use the CLI on the gateway host instead.
+  const isLocalhost = ["localhost", "127.0.0.1", "::1", "[::1]"].includes(
+    window.location.hostname,
+  );
+  // The browser knows the gateway's real host:port (it is talking to it), so it
+  // can show the exact recovery command — including the alternate port that made
+  // the config-default `get-paircode` miss the running instance (#5266).
+  const gatewayPort = window.location.port;
+  const cliRecoveryCommand = `zeroclaw gateway get-paircode --new${gatewayPort ? ` --port ${gatewayPort}` : ""}`;
+
+  // Fetch the current pairing code (public endpoint works in Docker too)
+  useEffect(() => {
+    let cancelled = false;
+    getAdminPairCode()
+      .then((data) => {
+        if (!cancelled && data.pairing_code) {
+          setDisplayCode(data.pairing_code);
+          setCode(data.pairing_code); // auto-fill so user just clicks "Pair"
+        }
+      })
+      .catch(() => {
+        // Endpoint not reachable — user must check terminal / docker logs
+      })
+      .finally(() => {
+        if (!cancelled) setCodeLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
-    setError('');
+    setError("");
     try {
       await onPair(code);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Pairing failed');
+      setError(err instanceof Error ? err.message : "Pairing failed");
     } finally {
       setLoading(false);
     }
   };
 
+  // Mint a fresh code on demand against the localhost-only admin endpoint. This
+  // is the in-band escape from the #5266 dead end: an already-paired gateway
+  // prints no code at startup, so without this the dashboard's 6-digit prompt
+  // has no code to enter and no obvious way forward.
+  const handleGenerate = async () => {
+    setGenerating(true);
+    setError("");
+    try {
+      const data = await generatePairCode();
+      if (data.pairing_code) {
+        setDisplayCode(data.pairing_code);
+        setCode(data.pairing_code); // auto-fill so the user just clicks "Pair"
+      } else {
+        // Pairing required but no code minted (e.g. disabled) — point at the CLI.
+        setShowCliFallback(true);
+      }
+    } catch (err: unknown) {
+      if (err instanceof PairCodeForbiddenError) {
+        // Non-loopback origin: the browser can't mint; show the CLI command.
+        setShowCliFallback(true);
+      } else {
+        setError(
+          err instanceof Error ? err.message : "Failed to generate pairing code",
+        );
+      }
+    } finally {
+      setGenerating(false);
+    }
+  };
+
   return (
-    <div className="min-h-screen bg-gray-950 flex items-center justify-center">
-      <div className="bg-gray-900 rounded-xl p-8 w-full max-w-md border border-gray-800">
-        <div className="text-center mb-6">
-          <h1 className="text-2xl font-bold text-white mb-2">ZeroClaw</h1>
-          <p className="text-gray-400">Enter the pairing code from your terminal</p>
+    <div
+      className="min-h-screen flex items-center justify-center"
+      style={{ background: "var(--pc-bg-base)" }}
+    >
+      {/* Ambient glow */}
+      <div className="relative surface-panel p-8 w-full max-w-md animate-fade-in-scale">
+        <div className="text-center mb-8">
+          <img
+            src={`${basePath}/_app/logo.png`}
+            alt="ZeroClaw"
+            className="h-20 w-20 rounded-2xl object-cover mx-auto mb-4 animate-float"
+            onError={(e) => {
+              e.currentTarget.style.display = "none";
+            }}
+          />
+          <h1 className="text-2xl font-bold mb-2 text-gradient-blue">
+            ZeroClaw
+          </h1>
+          <p className="text-sm" style={{ color: "var(--pc-text-muted)" }}>
+            {codeLoading
+              ? "Checking pairing status…"
+              : displayCode
+                ? "Your pairing code — click Pair to connect"
+                : "This gateway is already paired — generate a code to add this device"}
+          </p>
         </div>
+
+        {/* Already paired, no code minted at startup (#5266): offer a self-serve
+            mint on localhost, or the equivalent CLI command everywhere else. */}
+        {!codeLoading && !displayCode && (
+          <div
+            className="mb-6 p-4 rounded-2xl border text-center text-sm"
+            style={{
+              background: "var(--pc-bg-elevated)",
+              borderColor: "var(--pc-border)",
+              color: "var(--pc-text-muted)",
+            }}
+          >
+            {isLocalhost && !showCliFallback ? (
+              <>
+                <p className="mb-3">
+                  No pairing code was generated because a device is already
+                  paired.
+                </p>
+                <button
+                  type="button"
+                  onClick={handleGenerate}
+                  disabled={generating}
+                  className="btn-electric w-full py-3 text-sm font-semibold tracking-wide"
+                >
+                  {generating ? (
+                    <span className="flex items-center justify-center gap-2">
+                      <span className="h-4 w-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                      Generating…
+                    </span>
+                  ) : (
+                    "Generate pairing code"
+                  )}
+                </button>
+              </>
+            ) : (
+              <>
+                <p className="mb-2">
+                  {isLocalhost
+                    ? "Couldn't generate a code from the browser. On the machine running the gateway, run:"
+                    : "Pairing codes can only be generated on the machine running the gateway. Run:"}
+                </p>
+                <code
+                  className="block px-3 py-2 rounded-lg font-mono text-xs break-all select-all"
+                  style={{
+                    background: "var(--pc-bg-code)",
+                    color: "var(--pc-text-primary)",
+                  }}
+                >
+                  {cliRecoveryCommand}
+                </code>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* Show the pairing code if available (localhost) */}
+        {!codeLoading && displayCode && (
+          <div
+            className="mb-6 p-4 rounded-2xl text-center border"
+            style={{
+              background: "var(--pc-accent-glow)",
+              borderColor: "var(--pc-accent-dim)",
+            }}
+          >
+            <div
+              className="text-2xl font-mono font-bold tracking-widest break-all py-2"
+              style={{ color: "var(--pc-text-primary)" }}
+            >
+              {displayCode}
+            </div>
+            <p
+              className="text-xs mt-2"
+              style={{ color: "var(--pc-text-muted)" }}
+            >
+              Enter this code below or on another device
+            </p>
+          </div>
+        )}
+
         <form onSubmit={handleSubmit}>
+          {/* Pairing codes are case-sensitive alphanumeric by default
+              (#6613). Mobile keyboards auto-capitalise and autocorrect free
+              text, which silently corrupts a typed or pasted code, so both
+              are turned off here. */}
           <input
             type="text"
             value={code}
             onChange={(e) => setCode(e.target.value)}
-            placeholder="6-digit code"
-            className="w-full px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-white text-center text-2xl tracking-widest focus:outline-none focus:border-blue-500 mb-4"
-            maxLength={6}
+            placeholder="pairing code"
+            className="input-electric w-full px-4 py-4 text-center text-xl tracking-widest font-medium mb-4"
+            maxLength={128}
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
             autoFocus
           />
           {error && (
-            <p className="text-red-400 text-sm mb-4 text-center">{error}</p>
+            <p
+              aria-live="polite"
+              className="text-sm mb-4 text-center animate-fade-in"
+              style={{ color: "var(--color-status-error)" }}
+            >
+              {error}
+            </p>
           )}
           <button
             type="submit"
             disabled={loading || code.length < 6}
-            className="w-full py-3 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded-lg font-medium transition-colors"
+            className="btn-electric w-full py-3.5 text-sm font-semibold tracking-wide"
           >
-            {loading ? 'Pairing...' : 'Pair'}
+            {loading ? (
+              <span className="flex items-center justify-center gap-2">
+                <span className="h-4 w-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                Pairing...
+              </span>
+            ) : (
+              "Pair"
+            )}
           </button>
         </form>
       </div>
@@ -80,60 +372,100 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
 }
 
 function AppContent() {
-  const { isAuthenticated, loading, pair, logout } = useAuth();
-  const [locale, setLocaleState] = useState('tr');
+  const { isAuthenticated, requiresPairing, loading, pair, logout } = useAuth();
+  const [locale, setLocaleState] = useState(loadLocale());
+  const draftStore = useDraftStore();
+  setLocale(locale as Locale);
 
   const setAppLocale = (newLocale: string) => {
     setLocaleState(newLocale);
     setLocale(newLocale as Locale);
+    saveLocale(newLocale);
   };
 
   // Listen for 401 events to force logout
   useEffect(() => {
-    const handler = () => {
-      logout();
-    };
-    window.addEventListener('zeroclaw-unauthorized', handler);
-    return () => window.removeEventListener('zeroclaw-unauthorized', handler);
+    window.addEventListener("zeroclaw-unauthorized", logout);
+    return () => window.removeEventListener("zeroclaw-unauthorized", logout);
   }, [logout]);
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-gray-950 flex items-center justify-center">
-        <p className="text-gray-400">Connecting...</p>
+      <div
+        className="min-h-screen flex items-center justify-center"
+        style={{ background: "var(--pc-bg-base)" }}
+      >
+        <div className="flex flex-col items-center gap-4 animate-fade-in">
+          <div
+            className="h-10 w-10 border-2 rounded-full animate-spin"
+            style={{
+              borderColor: "var(--pc-border)",
+              borderTopColor: "var(--pc-accent)",
+            }}
+          />
+          <p className="text-sm" style={{ color: "var(--pc-text-muted)" }}>
+            Connecting...
+          </p>
+        </div>
       </div>
     );
   }
 
-  if (!isAuthenticated) {
+  if (!isAuthenticated && requiresPairing) {
     return <PairingDialog onPair={pair} />;
   }
 
   return (
-    <LocaleContext.Provider value={{ locale, setAppLocale }}>
-      <Routes>
-        <Route element={<Layout />}>
-          <Route path="/" element={<Dashboard />} />
-          <Route path="/agent" element={<AgentChat />} />
-          <Route path="/tools" element={<Tools />} />
-          <Route path="/cron" element={<Cron />} />
-          <Route path="/integrations" element={<Integrations />} />
-          <Route path="/memory" element={<Memory />} />
-          <Route path="/config" element={<Config />} />
-          <Route path="/cost" element={<Cost />} />
-          <Route path="/logs" element={<Logs />} />
-          <Route path="/doctor" element={<Doctor />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Route>
-      </Routes>
-    </LocaleContext.Provider>
+    <DraftContext.Provider value={draftStore}>
+      <ConfigDraftProvider>
+        <LocaleContext.Provider value={{ locale, setAppLocale }}>
+          <FreshInstallRedirect />
+          <Router />
+        </LocaleContext.Provider>
+      </ConfigDraftProvider>
+    </DraftContext.Provider>
   );
+}
+
+// Redirects fresh installs (no agents yet, Quickstart never completed)
+// from `/` to `/quickstart`. The daemon always writes a default
+// config.toml on init, so file existence isn't the right signal —
+// we ask the gateway via /api/quickstart/state which reports
+// quickstart_completed plus the live agents list.
+//
+// Fires once per session. Only redirects when the user lands at `/` —
+// manual navigation to other routes is left alone, so returning users
+// who already have agents can always reach Quickstart from the nav.
+function FreshInstallRedirect() {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [checked, setChecked] = useState(false);
+
+  useEffect(() => {
+    if (checked) return;
+    setChecked(true);
+    if (location.pathname !== "/") return;
+    void getQuickstartState()
+      .then((state) => {
+        if (!state.quickstart_completed && state.agents.length === 0) {
+          navigate("/quickstart", { replace: true });
+        }
+      })
+      .catch(() => {
+        // Status check failed (network blip, gateway hiccup); the
+        // dashboard renders normally as the safe default.
+      });
+  }, [checked, location.pathname, navigate]);
+
+  return null;
 }
 
 export default function App() {
   return (
     <AuthProvider>
-      <AppContent />
+      <ThemeProvider>
+        <AppContent />
+      </ThemeProvider>
     </AuthProvider>
   );
 }

@@ -65,12 +65,12 @@ Use this to act as the "user" or "environment" the agent interacts with.
 
 ### 5. Persistence & Shared Workspace
 
-The local `playground/` directory (in repo root) is mounted as the shared workspace:
+The `playground/` directory (in repo root) is mounted as the shared workspace:
 
 - **Agent**: `/zeroclaw-data/workspace`
 - **Sandbox**: `/home/developer/workspace`
 
-Files created by the agent are visible to the sandbox user, and vice versa.
+Files created by the agent are visible to the sandbox user, and vice versa. The directory is git-ignored and auto-populated on first run — the agent creates `brain.db`, `sessions.db`, personality files (`IDENTITY.md`, `SOUL.md`), and hygiene state automatically.
 
 The agent configuration lives in `target/.zeroclaw` (mounted to `/zeroclaw-data/.zeroclaw`), so settings persist across container rebuilds.
 
@@ -82,7 +82,7 @@ Stop containers and remove volumes and generated config:
 ./dev/cli.sh clean
 ```
 
-**Note:** This removes `target/.zeroclaw` (config/DB) but leaves the `playground/` directory intact. To fully wipe everything, manually delete `playground/`.
+**Note:** This removes `target/.zeroclaw` (config/DB) but leaves the `playground/` directory intact. To fully wipe workspace data, manually delete `playground/`.
 
 ## Local CI/CD (Docker-Only)
 
@@ -115,17 +115,10 @@ To run an opt-in strict lint audit locally:
 ./dev/ci.sh lint-strict
 ```
 
-To run the incremental strict gate (changed Rust lines only):
-
-```bash
-./dev/ci.sh lint-delta
-```
-
 ### 3. Run targeted stages
 
 ```bash
 ./dev/ci.sh lint
-./dev/ci.sh lint-delta
 ./dev/ci.sh test
 ./dev/ci.sh build
 ./dev/ci.sh deny
@@ -166,4 +159,4 @@ Note: local `deny` focuses on license/source policy; advisory scanning is handle
 - The root `Dockerfile` also caches Rust `target/` (`id=zeroclaw-target`) to speed repeat local image builds.
 - Local CI reuses named Docker volumes for Cargo registry/git and target outputs.
 - `./dev/ci.sh docker-smoke` and `./dev/ci.sh all` now use `docker buildx` local cache at `.cache/buildx-smoke` when available.
-- The CI image keeps Rust toolchain defaults from `rust:1.92-slim` and installs pinned toolchain `1.92.0` (no custom `CARGO_HOME`/`RUSTUP_HOME` overrides), preventing repeated toolchain bootstrapping on each run.
+- The CI image keeps Rust toolchain defaults from `rust:1.98-slim` and installs pinned toolchain `1.98.0` (no custom `CARGO_HOME`/`RUSTUP_HOME` overrides), preventing repeated toolchain bootstrapping on each run.

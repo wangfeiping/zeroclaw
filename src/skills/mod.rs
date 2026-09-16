@@ -1,869 +1,194 @@
+#[allow(unused_imports)]
+pub use zeroclaw_runtime::skills::*;
+
 use anyhow::{Context, Result};
-use directories::UserDirs;
-use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, SystemTime};
+use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
+use zeroclaw_runtime::skills::{ScaffoldOptions, SkillFrontmatter, SkillsService};
 
-mod audit;
-
-const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
-const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
-const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
-
-/// A skill is a user-defined or community-built capability.
-/// Skills live in `~/.zeroclaw/workspace/skills/<name>/SKILL.md`
-/// and can include tool definitions, prompts, and automation scripts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Skill {
-    pub name: String,
-    pub description: String,
-    pub version: String,
-    #[serde(default)]
-    pub author: Option<String>,
-    #[serde(default)]
-    pub tags: Vec<String>,
-    #[serde(default)]
-    pub tools: Vec<SkillTool>,
-    #[serde(default)]
-    pub prompts: Vec<String>,
-    #[serde(skip)]
-    pub location: Option<PathBuf>,
-}
-
-/// A tool defined by a skill (shell command, HTTP call, etc.)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillTool {
-    pub name: String,
-    pub description: String,
-    /// "shell", "http", "script"
-    pub kind: String,
-    /// The command/URL/script to execute
-    pub command: String,
-    #[serde(default)]
-    pub args: HashMap<String, String>,
-}
-
-/// Skill manifest parsed from SKILL.toml
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SkillManifest {
-    skill: SkillMeta,
-    #[serde(default)]
-    tools: Vec<SkillTool>,
-    #[serde(default)]
-    prompts: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SkillMeta {
-    name: String,
-    description: String,
-    #[serde(default = "default_version")]
-    version: String,
-    #[serde(default)]
-    author: Option<String>,
-    #[serde(default)]
-    tags: Vec<String>,
-}
-
-fn default_version() -> String {
-    "0.1.0".to_string()
-}
-
-/// Load all skills from the workspace skills directory
-pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
-    load_skills_with_open_skills_config(workspace_dir, None, None)
-}
-
-/// Load skills using runtime config values (preferred at runtime).
-pub fn load_skills_with_config(workspace_dir: &Path, config: &crate::config::Config) -> Vec<Skill> {
-    load_skills_with_open_skills_config(
-        workspace_dir,
-        Some(config.skills.open_skills_enabled),
-        config.skills.open_skills_dir.as_deref(),
-    )
-}
-
-fn load_skills_with_open_skills_config(
-    workspace_dir: &Path,
-    config_open_skills_enabled: Option<bool>,
-    config_open_skills_dir: Option<&str>,
-) -> Vec<Skill> {
-    let mut skills = Vec::new();
-
-    if let Some(open_skills_dir) =
-        ensure_open_skills_repo(config_open_skills_enabled, config_open_skills_dir)
+/// Resolve a `cli-*` Fluent key for skill-bundle CLI output. Under `agent-runtime`
+/// (default + what CI/release build) this routes through Fluent; without it the
+/// runtime i18n crate is absent, so the English `fallback` is used.
+#[allow(unused_variables)]
+fn mt(key: &str, fallback: &str) -> String {
+    #[cfg(feature = "agent-runtime")]
     {
-        skills.extend(load_open_skills(&open_skills_dir));
+        zeroclaw_runtime::i18n::get_required_cli_string(key)
     }
-
-    skills.extend(load_workspace_skills(workspace_dir));
-    skills
-}
-
-fn load_workspace_skills(workspace_dir: &Path) -> Vec<Skill> {
-    let skills_dir = workspace_dir.join("skills");
-    load_skills_from_directory(&skills_dir)
-}
-
-fn load_skills_from_directory(skills_dir: &Path) -> Vec<Skill> {
-    if !skills_dir.exists() {
-        return Vec::new();
-    }
-
-    let mut skills = Vec::new();
-
-    let Ok(entries) = std::fs::read_dir(skills_dir) else {
-        return skills;
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-
-        match audit::audit_skill_directory(&path) {
-            Ok(report) if report.is_clean() => {}
-            Ok(report) => {
-                tracing::warn!(
-                    "skipping insecure skill directory {}: {}",
-                    path.display(),
-                    report.summary()
-                );
-                continue;
-            }
-            Err(err) => {
-                tracing::warn!(
-                    "skipping unauditable skill directory {}: {err}",
-                    path.display()
-                );
-                continue;
-            }
-        }
-
-        // Try SKILL.toml first, then SKILL.md
-        let manifest_path = path.join("SKILL.toml");
-        let md_path = path.join("SKILL.md");
-
-        if manifest_path.exists() {
-            if let Ok(skill) = load_skill_toml(&manifest_path) {
-                skills.push(skill);
-            }
-        } else if md_path.exists() {
-            if let Ok(skill) = load_skill_md(&md_path, &path) {
-                skills.push(skill);
-            }
-        }
-    }
-
-    skills
-}
-
-fn load_open_skills(repo_dir: &Path) -> Vec<Skill> {
-    // Modern open-skills layout stores skill packages in `skills/<name>/SKILL.md`.
-    // Prefer that structure to avoid treating repository docs (e.g. CONTRIBUTING.md)
-    // as executable skills.
-    let nested_skills_dir = repo_dir.join("skills");
-    if nested_skills_dir.is_dir() {
-        return load_skills_from_directory(&nested_skills_dir);
-    }
-
-    let mut skills = Vec::new();
-
-    let Ok(entries) = std::fs::read_dir(repo_dir) else {
-        return skills;
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-
-        let is_markdown = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
-        if !is_markdown {
-            continue;
-        }
-
-        let is_readme = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.eq_ignore_ascii_case("README.md"));
-        if is_readme {
-            continue;
-        }
-
-        match audit::audit_open_skill_markdown(&path, repo_dir) {
-            Ok(report) if report.is_clean() => {}
-            Ok(report) => {
-                tracing::warn!(
-                    "skipping insecure open-skill file {}: {}",
-                    path.display(),
-                    report.summary()
-                );
-                continue;
-            }
-            Err(err) => {
-                tracing::warn!(
-                    "skipping unauditable open-skill file {}: {err}",
-                    path.display()
-                );
-                continue;
-            }
-        }
-
-        if let Ok(skill) = load_open_skill_md(&path) {
-            skills.push(skill);
-        }
-    }
-
-    skills
-}
-
-fn parse_open_skills_enabled(raw: &str) -> Option<bool> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        fallback.to_string() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
     }
 }
 
-fn open_skills_enabled_from_sources(
-    config_open_skills_enabled: Option<bool>,
-    env_override: Option<&str>,
-) -> bool {
-    if let Some(raw) = env_override {
-        if let Some(enabled) = parse_open_skills_enabled(&raw) {
-            return enabled;
-        }
-        if !raw.trim().is_empty() {
-            tracing::warn!(
-                "Ignoring invalid ZEROCLAW_OPEN_SKILLS_ENABLED (valid: 1|0|true|false|yes|no|on|off)"
-            );
-        }
+/// `mt` with `{$name}` arguments.
+#[allow(unused_variables)]
+fn mta(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
+    #[cfg(feature = "agent-runtime")]
+    {
+        zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
     }
-
-    config_open_skills_enabled.unwrap_or(false)
-}
-
-fn open_skills_enabled(config_open_skills_enabled: Option<bool>) -> bool {
-    let env_override = std::env::var("ZEROCLAW_OPEN_SKILLS_ENABLED").ok();
-    open_skills_enabled_from_sources(config_open_skills_enabled, env_override.as_deref())
-}
-
-fn resolve_open_skills_dir_from_sources(
-    env_dir: Option<&str>,
-    config_dir: Option<&str>,
-    home_dir: Option<&Path>,
-) -> Option<PathBuf> {
-    let parse_dir = |raw: &str| {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(trimmed))
-        }
-    };
-
-    if let Some(env_dir) = env_dir.and_then(parse_dir) {
-        return Some(env_dir);
-    }
-    if let Some(config_dir) = config_dir.and_then(parse_dir) {
-        return Some(config_dir);
-    }
-    home_dir.map(|home| home.join("open-skills"))
-}
-
-fn resolve_open_skills_dir(config_open_skills_dir: Option<&str>) -> Option<PathBuf> {
-    let env_dir = std::env::var("ZEROCLAW_OPEN_SKILLS_DIR").ok();
-    let home_dir = UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
-    resolve_open_skills_dir_from_sources(
-        env_dir.as_deref(),
-        config_open_skills_dir,
-        home_dir.as_deref(),
-    )
-}
-
-fn ensure_open_skills_repo(
-    config_open_skills_enabled: Option<bool>,
-    config_open_skills_dir: Option<&str>,
-) -> Option<PathBuf> {
-    if !open_skills_enabled(config_open_skills_enabled) {
-        return None;
-    }
-
-    let repo_dir = resolve_open_skills_dir(config_open_skills_dir)?;
-
-    if !repo_dir.exists() {
-        if !clone_open_skills_repo(&repo_dir) {
-            return None;
-        }
-        let _ = mark_open_skills_synced(&repo_dir);
-        return Some(repo_dir);
-    }
-
-    if should_sync_open_skills(&repo_dir) {
-        if pull_open_skills_repo(&repo_dir) {
-            let _ = mark_open_skills_synced(&repo_dir);
-        } else {
-            tracing::warn!(
-                "open-skills update failed; using local copy from {}",
-                repo_dir.display()
-            );
-        }
-    }
-
-    Some(repo_dir)
-}
-
-fn clone_open_skills_repo(repo_dir: &Path) -> bool {
-    if let Some(parent) = repo_dir.parent() {
-        if let Err(err) = std::fs::create_dir_all(parent) {
-            tracing::warn!(
-                "failed to create open-skills parent directory {}: {err}",
-                parent.display()
-            );
-            return false;
-        }
-    }
-
-    let output = Command::new("git")
-        .args(["clone", "--depth", "1", OPEN_SKILLS_REPO_URL])
-        .arg(repo_dir)
-        .output();
-
-    match output {
-        Ok(result) if result.status.success() => {
-            tracing::info!("initialized open-skills at {}", repo_dir.display());
-            true
-        }
-        Ok(result) => {
-            let stderr = String::from_utf8_lossy(&result.stderr);
-            tracing::warn!("failed to clone open-skills: {stderr}");
-            false
-        }
-        Err(err) => {
-            tracing::warn!("failed to run git clone for open-skills: {err}");
-            false
-        }
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        fallback.to_string() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
     }
 }
 
-fn pull_open_skills_repo(repo_dir: &Path) -> bool {
-    // If user points to a non-git directory via env var, keep using it without pulling.
-    if !repo_dir.join(".git").exists() {
-        return true;
-    }
-
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_dir)
-        .args(["pull", "--ff-only"])
-        .output();
-
-    match output {
-        Ok(result) if result.status.success() => true,
-        Ok(result) => {
-            let stderr = String::from_utf8_lossy(&result.stderr);
-            tracing::warn!("failed to pull open-skills updates: {stderr}");
-            false
-        }
-        Err(err) => {
-            tracing::warn!("failed to run git pull for open-skills: {err}");
-            false
-        }
-    }
+pub mod creator {
+    #[allow(unused_imports)]
+    pub use zeroclaw_runtime::skills::creator::*;
+}
+pub mod audit {
+    #[allow(unused_imports)]
+    pub use zeroclaw_runtime::skills::audit::*;
+}
+pub mod skill_tool {
+    #[allow(unused_imports)]
+    pub use zeroclaw_runtime::skills::skill_tool::*;
+}
+pub mod skill_http {
+    #[allow(unused_imports)]
+    pub use zeroclaw_runtime::skills::skill_http::*;
 }
 
-fn should_sync_open_skills(repo_dir: &Path) -> bool {
-    let marker = repo_dir.join(OPEN_SKILLS_SYNC_MARKER);
-    let Ok(metadata) = std::fs::metadata(marker) else {
-        return true;
-    };
-    let Ok(modified_at) = metadata.modified() else {
-        return true;
-    };
-    let Ok(age) = SystemTime::now().duration_since(modified_at) else {
-        return true;
-    };
-
-    age >= Duration::from_secs(OPEN_SKILLS_SYNC_INTERVAL_SECS)
-}
-
-fn mark_open_skills_synced(repo_dir: &Path) -> Result<()> {
-    std::fs::write(repo_dir.join(OPEN_SKILLS_SYNC_MARKER), b"synced")?;
-    Ok(())
-}
-
-/// Load a skill from a SKILL.toml manifest
-fn load_skill_toml(path: &Path) -> Result<Skill> {
-    let content = std::fs::read_to_string(path)?;
-    let manifest: SkillManifest = toml::from_str(&content)?;
-
-    Ok(Skill {
-        name: manifest.skill.name,
-        description: manifest.skill.description,
-        version: manifest.skill.version,
-        author: manifest.skill.author,
-        tags: manifest.skill.tags,
-        tools: manifest.tools,
-        prompts: manifest.prompts,
-        location: Some(path.to_path_buf()),
-    })
-}
-
-/// Load a skill from a SKILL.md file (simpler format)
-fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
-    let content = std::fs::read_to_string(path)?;
-    let name = dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
-
-    Ok(Skill {
-        name,
-        description: extract_description(&content),
-        version: "0.1.0".to_string(),
-        author: None,
-        tags: Vec::new(),
-        tools: Vec::new(),
-        prompts: vec![content],
-        location: Some(path.to_path_buf()),
-    })
-}
-
-fn load_open_skill_md(path: &Path) -> Result<Skill> {
-    let content = std::fs::read_to_string(path)?;
-    let name = path
-        .file_stem()
-        .and_then(|n| n.to_str())
-        .unwrap_or("open-skill")
-        .to_string();
-
-    Ok(Skill {
-        name,
-        description: extract_description(&content),
-        version: "open-skills".to_string(),
-        author: Some("besoeasy/open-skills".to_string()),
-        tags: vec!["open-skills".to_string()],
-        tools: Vec::new(),
-        prompts: vec![content],
-        location: Some(path.to_path_buf()),
-    })
-}
-
-fn extract_description(content: &str) -> String {
-    content
-        .lines()
-        .find(|line| !line.starts_with('#') && !line.trim().is_empty())
-        .unwrap_or("No description")
-        .trim()
-        .to_string()
-}
-
-fn append_xml_escaped(out: &mut String, text: &str) {
-    for ch in text.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            _ => out.push(ch),
-        }
-    }
-}
-
-fn write_xml_text_element(out: &mut String, indent: usize, tag: &str, value: &str) {
-    for _ in 0..indent {
-        out.push(' ');
-    }
-    out.push('<');
-    out.push_str(tag);
-    out.push('>');
-    append_xml_escaped(out, value);
-    out.push_str("</");
-    out.push_str(tag);
-    out.push_str(">\n");
-}
-
-fn resolve_skill_location(skill: &Skill, workspace_dir: &Path) -> PathBuf {
-    skill.location.clone().unwrap_or_else(|| {
-        workspace_dir
-            .join("skills")
-            .join(&skill.name)
-            .join("SKILL.md")
-    })
-}
-
-fn render_skill_location(skill: &Skill, workspace_dir: &Path, prefer_relative: bool) -> String {
-    let location = resolve_skill_location(skill, workspace_dir);
-    if prefer_relative {
-        if let Ok(relative) = location.strip_prefix(workspace_dir) {
-            return relative.display().to_string();
-        }
-    }
-    location.display().to_string()
-}
-
-/// Build the "Available Skills" system prompt section with full skill instructions.
-pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
-    skills_to_prompt_with_mode(
-        skills,
-        workspace_dir,
-        crate::config::SkillsPromptInjectionMode::Full,
-    )
-}
-
-/// Build the "Available Skills" system prompt section with configurable verbosity.
-pub fn skills_to_prompt_with_mode(
-    skills: &[Skill],
-    workspace_dir: &Path,
-    mode: crate::config::SkillsPromptInjectionMode,
-) -> String {
-    use std::fmt::Write;
-
-    if skills.is_empty() {
-        return String::new();
-    }
-
-    let mut prompt = match mode {
-        crate::config::SkillsPromptInjectionMode::Full => String::from(
-            "## Available Skills\n\n\
-             Skill instructions and tool metadata are preloaded below.\n\
-             Follow these instructions directly; do not read skill files at runtime unless the user asks.\n\n\
-             <available_skills>\n",
-        ),
-        crate::config::SkillsPromptInjectionMode::Compact => String::from(
-            "## Available Skills\n\n\
-             Skill summaries are preloaded below to keep context compact.\n\
-             Skill instructions are loaded on demand: read the skill file in `location` only when needed.\n\n\
-             <available_skills>\n",
-        ),
-    };
-
-    for skill in skills {
-        let _ = writeln!(prompt, "  <skill>");
-        write_xml_text_element(&mut prompt, 4, "name", &skill.name);
-        write_xml_text_element(&mut prompt, 4, "description", &skill.description);
-        let location = render_skill_location(
-            skill,
-            workspace_dir,
-            matches!(mode, crate::config::SkillsPromptInjectionMode::Compact),
-        );
-        write_xml_text_element(&mut prompt, 4, "location", &location);
-
-        if matches!(mode, crate::config::SkillsPromptInjectionMode::Full) {
-            if !skill.prompts.is_empty() {
-                let _ = writeln!(prompt, "    <instructions>");
-                for instruction in &skill.prompts {
-                    write_xml_text_element(&mut prompt, 6, "instruction", instruction);
-                }
-                let _ = writeln!(prompt, "    </instructions>");
-            }
-
-            if !skill.tools.is_empty() {
-                let _ = writeln!(prompt, "    <tools>");
-                for tool in &skill.tools {
-                    let _ = writeln!(prompt, "      <tool>");
-                    write_xml_text_element(&mut prompt, 8, "name", &tool.name);
-                    write_xml_text_element(&mut prompt, 8, "description", &tool.description);
-                    write_xml_text_element(&mut prompt, 8, "kind", &tool.kind);
-                    let _ = writeln!(prompt, "      </tool>");
-                }
-                let _ = writeln!(prompt, "    </tools>");
-            }
-        }
-
-        let _ = writeln!(prompt, "  </skill>");
-    }
-
-    prompt.push_str("</available_skills>");
-    prompt
-}
-
-/// Get the skills directory path
-pub fn skills_dir(workspace_dir: &Path) -> PathBuf {
-    workspace_dir.join("skills")
-}
-
-/// Initialize the skills directory with a README
-pub fn init_skills_dir(workspace_dir: &Path) -> Result<()> {
-    let dir = skills_dir(workspace_dir);
-    std::fs::create_dir_all(&dir)?;
-
-    let readme = dir.join("README.md");
-    if !readme.exists() {
-        std::fs::write(
-            &readme,
-            "# ZeroClaw Skills\n\n\
-             Each subdirectory is a skill. Create a `SKILL.toml` or `SKILL.md` file inside.\n\n\
-             ## SKILL.toml format\n\n\
-             ```toml\n\
-             [skill]\n\
-             name = \"my-skill\"\n\
-             description = \"What this skill does\"\n\
-             version = \"0.1.0\"\n\
-             author = \"your-name\"\n\
-             tags = [\"productivity\", \"automation\"]\n\n\
-             [[tools]]\n\
-             name = \"my_tool\"\n\
-             description = \"What this tool does\"\n\
-             kind = \"shell\"\n\
-             command = \"echo hello\"\n\
-             ```\n\n\
-             ## SKILL.md format (simpler)\n\n\
-             Just write a markdown file with instructions for the agent.\n\
-             The agent will read it and follow the instructions.\n\n\
-             ## Installing community skills\n\n\
-             ```bash\n\
-             zeroclaw skills install <source>\n\
-             zeroclaw skills list\n\
-             ```\n",
-        )?;
-    }
-
-    Ok(())
-}
-
-fn is_git_source(source: &str) -> bool {
-    is_git_scheme_source(source, "https://")
-        || is_git_scheme_source(source, "http://")
-        || is_git_scheme_source(source, "ssh://")
-        || is_git_scheme_source(source, "git://")
-        || is_git_scp_source(source)
-}
-
-fn is_git_scheme_source(source: &str, scheme: &str) -> bool {
-    let Some(rest) = source.strip_prefix(scheme) else {
-        return false;
-    };
-    if rest.is_empty() || rest.starts_with('/') {
-        return false;
-    }
-
-    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    !host.is_empty()
-}
-
-fn is_git_scp_source(source: &str) -> bool {
-    // SCP-like syntax accepted by git, e.g. git@host:owner/repo.git
-    // Keep this strict enough to avoid treating local paths as git remotes.
-    let Some((user_host, remote_path)) = source.split_once(':') else {
-        return false;
-    };
-    if remote_path.is_empty() {
-        return false;
-    }
-    if source.contains("://") {
-        return false;
-    }
-
-    let Some((user, host)) = user_host.split_once('@') else {
-        return false;
-    };
-    !user.is_empty()
-        && !host.is_empty()
-        && !user.contains('/')
-        && !user.contains('\\')
-        && !host.contains('/')
-        && !host.contains('\\')
-}
-
-fn snapshot_skill_children(skills_path: &Path) -> Result<HashSet<PathBuf>> {
-    let mut paths = HashSet::new();
-    for entry in std::fs::read_dir(skills_path)? {
-        let entry = entry?;
-        paths.insert(entry.path());
-    }
-    Ok(paths)
-}
-
-fn detect_newly_installed_directory(
-    skills_path: &Path,
-    before: &HashSet<PathBuf>,
-) -> Result<PathBuf> {
-    let mut created = Vec::new();
-    for entry in std::fs::read_dir(skills_path)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !before.contains(&path) && path.is_dir() {
-            created.push(path);
-        }
-    }
-
-    match created.len() {
-        1 => Ok(created.remove(0)),
-        0 => anyhow::bail!(
-            "Unable to determine installed skill directory after clone (no new directory found)"
-        ),
-        _ => anyhow::bail!(
-            "Unable to determine installed skill directory after clone (multiple new directories found)"
-        ),
-    }
-}
-
-fn enforce_skill_security_audit(skill_path: &Path) -> Result<audit::SkillAuditReport> {
-    let report = audit::audit_skill_directory(skill_path)?;
-    if report.is_clean() {
-        return Ok(report);
-    }
-
-    anyhow::bail!("Skill security audit failed: {}", report.summary());
-}
-
-fn remove_git_metadata(skill_path: &Path) -> Result<()> {
-    let git_dir = skill_path.join(".git");
-    if git_dir.exists() {
-        std::fs::remove_dir_all(&git_dir)
-            .with_context(|| format!("failed to remove {}", git_dir.display()))?;
-    }
-    Ok(())
-}
-
-fn copy_dir_recursive_secure(src: &Path, dest: &Path) -> Result<()> {
-    let src_meta = std::fs::symlink_metadata(src)
-        .with_context(|| format!("failed to read metadata for {}", src.display()))?;
-    if src_meta.file_type().is_symlink() {
-        anyhow::bail!(
-            "Refusing to copy symlinked skill source path: {}",
-            src.display()
-        );
-    }
-    if !src_meta.is_dir() {
-        anyhow::bail!("Skill source must be a directory: {}", src.display());
-    }
-
-    std::fs::create_dir_all(dest)
-        .with_context(|| format!("failed to create destination {}", dest.display()))?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dest_path = dest.join(entry.file_name());
-        let metadata = std::fs::symlink_metadata(&src_path)
-            .with_context(|| format!("failed to read metadata for {}", src_path.display()))?;
-
-        if metadata.file_type().is_symlink() {
-            anyhow::bail!(
-                "Refusing to copy symlink within skill source: {}",
-                src_path.display()
-            );
-        }
-
-        if metadata.is_dir() {
-            copy_dir_recursive_secure(&src_path, &dest_path)?;
-        } else if metadata.is_file() {
-            std::fs::copy(&src_path, &dest_path).with_context(|| {
-                format!(
-                    "failed to copy skill file from {} to {}",
-                    src_path.display(),
-                    dest_path.display()
-                )
-            })?;
-        }
-    }
-
-    Ok(())
-}
-
-fn install_local_skill_source(source: &str, skills_path: &Path) -> Result<(PathBuf, usize)> {
-    let source_path = PathBuf::from(source);
-    if !source_path.exists() {
-        anyhow::bail!("Source path does not exist: {source}");
-    }
-
-    let source_path = source_path
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize source path {source}"))?;
-    let _ = enforce_skill_security_audit(&source_path)?;
-
-    let name = source_path
-        .file_name()
-        .context("Source path must include a directory name")?;
-    let dest = skills_path.join(name);
-    if dest.exists() {
-        anyhow::bail!("Destination skill already exists: {}", dest.display());
-    }
-
-    if let Err(err) = copy_dir_recursive_secure(&source_path, &dest) {
-        let _ = std::fs::remove_dir_all(&dest);
-        return Err(err);
-    }
-
-    match enforce_skill_security_audit(&dest) {
-        Ok(report) => Ok((dest, report.files_scanned)),
-        Err(err) => {
-            let _ = std::fs::remove_dir_all(&dest);
-            Err(err)
-        }
-    }
-}
-
-fn install_git_skill_source(source: &str, skills_path: &Path) -> Result<(PathBuf, usize)> {
-    let before = snapshot_skill_children(skills_path)?;
-    let output = std::process::Command::new("git")
-        .args(["clone", "--depth", "1", source])
-        .current_dir(skills_path)
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Git clone failed: {stderr}");
-    }
-
-    let installed_dir = detect_newly_installed_directory(skills_path, &before)?;
-    remove_git_metadata(&installed_dir)?;
-    match enforce_skill_security_audit(&installed_dir) {
-        Ok(report) => Ok((installed_dir, report.files_scanned)),
-        Err(err) => {
-            let _ = std::fs::remove_dir_all(&installed_dir);
-            Err(err)
-        }
-    }
-}
-
-/// Handle the `skills` CLI command
-#[allow(clippy::too_many_lines)]
-pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Config) -> Result<()> {
-    let workspace_dir = &config.workspace_dir;
+// The lib target sees this as dead; only the bin target calls it from main.rs.
+#[allow(dead_code)]
+pub async fn handle_command(
+    command: crate::SkillCommands,
+    config: &crate::config::Config,
+) -> Result<()> {
+    let workspace_dir = &config.data_dir;
     match command {
-        crate::SkillCommands::List => {
-            let skills = load_skills_with_config(workspace_dir, config);
-            if skills.is_empty() {
-                println!("No skills installed.");
-                println!();
-                println!("  Create one: mkdir -p ~/.zeroclaw/workspace/skills/my-skill");
-                println!("              echo '# My Skill' > ~/.zeroclaw/workspace/skills/my-skill/SKILL.md");
-                println!();
-                println!("  Or install: zeroclaw skills install <source>");
-            } else {
-                println!("Installed skills ({}):", skills.len());
-                println!();
-                for skill in &skills {
-                    println!(
-                        "  {} {} — {}",
-                        console::style(&skill.name).white().bold(),
-                        console::style(format!("v{}", skill.version)).dim(),
-                        skill.description
+        crate::SkillCommands::List { agent, bundle } => {
+            let install_root = config.install_root_dir();
+            let allow_scripts = config.skills.allow_scripts;
+
+            // Build the ordered (label, skills) groups to display.
+            let mut rendered: Vec<(String, Vec<Skill>)> = Vec::new();
+            let mut skipped: Vec<DroppedSkill> = Vec::new();
+            if let Some(ref b) = bundle {
+                // A single bundle's on-disk skills.
+                let dir =
+                    zeroclaw_config::skill_bundles::resolve_directory(config, &install_root, b)
+                        .map_err(anyhow::Error::msg)?;
+                rendered.push((
+                    get_required_cli_string_with_args(
+                        "cli-skills-list-group-bundle",
+                        &[("alias", b)],
+                    ),
+                    load_skills_from_directory(&dir, allow_scripts).0,
+                ));
+            } else if let Some(ref a) = agent {
+                // Exactly what this agent loads at runtime — the same loader the
+                // agent boot/loop uses (workspace + open-skills + plugins +
+                // assigned bundles), so `list --agent` mirrors runtime behavior.
+                if config.agent(a).is_none() {
+                    anyhow::bail!(
+                        "{}",
+                        get_required_cli_string_with_args(
+                            "cli-skills-agent-not-configured",
+                            &[("alias", a)],
+                        )
                     );
-                    if !skill.tools.is_empty() {
-                        println!(
-                            "    Tools: {}",
-                            skill
-                                .tools
-                                .iter()
-                                .map(|t| t.name.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        );
+                }
+                let (skills, dropped, _shadowed) =
+                    load_skills_for_agent_from_config_audited(config, a);
+                skipped.extend(dropped);
+                rendered.push((
+                    get_required_cli_string_with_args(
+                        "cli-skills-list-group-agent",
+                        &[("alias", a)],
+                    ),
+                    skills,
+                ));
+            } else {
+                // Full inventory: every bundle, then the agent-agnostic sources
+                // (global dir + open-skills + plugins). `load_skills_with_config`
+                // is the same loader the old `list` used, so those rows are
+                // preservedreview).
+                for alias in config.skill_bundles.keys() {
+                    if let Ok(dir) = zeroclaw_config::skill_bundles::resolve_directory(
+                        config,
+                        &install_root,
+                        alias,
+                    ) {
+                        rendered.push((
+                            get_required_cli_string_with_args(
+                                "cli-skills-list-group-bundle",
+                                &[("alias", alias)],
+                            ),
+                            load_skills_from_directory(&dir, allow_scripts).0,
+                        ));
                     }
-                    if !skill.tags.is_empty() {
-                        println!("    Tags:  {}", skill.tags.join(", "));
+                }
+                let (skills, dropped) = load_skills_with_config_audited(&config.data_dir, config);
+                skipped.extend(dropped);
+                rendered.push((
+                    get_required_cli_string("cli-skills-list-group-global"),
+                    skills,
+                ));
+            }
+
+            let total: usize = rendered.iter().map(|(_, s)| s.len()).sum();
+
+            if total == 0 {
+                println!("{}", get_required_cli_string("cli-skills-none-installed"));
+                println!();
+                println!("{}", get_required_cli_string("cli-skills-create-hint"));
+                println!("{}", get_required_cli_string("cli-skills-install-hint"));
+            } else {
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-installed-header",
+                        &[("count", &total.to_string())],
+                    )
+                );
+                println!();
+                for (label, skills) in &rendered {
+                    if skills.is_empty() {
+                        continue;
+                    }
+                    println!("  {}", console::style(format!("[{label}]")).dim());
+                    for skill in skills {
+                        print_skill(skill);
+                    }
+                    println!();
+                }
+            }
+            if !skipped.is_empty() {
+                println!();
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-skipped-header",
+                        &[("count", &skipped.len().to_string())],
+                    )
+                );
+                println!();
+                for entry in &skipped {
+                    let (reason, scripts_blocked) = match &entry.reason {
+                        SkillDropReason::AuditFindings {
+                            summary,
+                            scripts_blocked,
+                        } => (summary.clone(), *scripts_blocked),
+                        SkillDropReason::AuditError(s) | SkillDropReason::ManifestParseError(s) => {
+                            (s.clone(), false)
+                        }
+                    };
+                    println!("  {}", console::style(&entry.name).yellow().bold());
+                    println!(
+                        "{}",
+                        get_required_cli_string_with_args(
+                            "cli-skills-skipped-reason",
+                            &[("reason", &reason)],
+                        )
+                    );
+                    if scripts_blocked && !config.skills.allow_scripts {
+                        println!(
+                            "{}",
+                            get_required_cli_string("cli-skills-skipped-scripts-hint")
+                        );
                     }
                 }
             }
@@ -875,14 +200,15 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             let target = if source_path.exists() {
                 source_path
             } else {
-                skills_dir(workspace_dir).join(&source)
+                locate_installed_skill_dir(config, &source)?
             };
 
-            if !target.exists() {
-                anyhow::bail!("Skill source or installed skill not found: {source}");
-            }
-
-            let report = audit::audit_skill_directory(&target)?;
+            let report = audit::audit_skill_directory_with_options(
+                &target,
+                audit::SkillAuditOptions {
+                    allow_scripts: config.skills.allow_scripts,
+                },
+            )?;
             if report.is_clean() {
                 println!(
                     "  {} Skill audit passed for {} ({} files scanned).",
@@ -901,577 +227,1252 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             for finding in report.findings {
                 println!("    - {finding}");
             }
-            anyhow::bail!("Skill audit failed.");
+            anyhow::bail!(get_required_cli_string("cli-skills-audit-failed"));
         }
-        crate::SkillCommands::Install { source } => {
-            println!("Installing skill from: {source}");
+        crate::SkillCommands::Install {
+            source,
+            agent,
+            bundle,
+            no_tier_banner,
+            skill,
+        } => {
+            println!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-skills-install-start",
+                    &[("source", &source)]
+                )
+            );
 
-            let skills_path = skills_dir(workspace_dir);
+            let location = resolve_install_location(config, agent.as_deref(), bundle.as_deref())?;
+            let skills_path = location.dir().to_path_buf();
             std::fs::create_dir_all(&skills_path)?;
 
-            if is_git_source(&source) {
-                let (installed_dir, files_scanned) =
-                    install_git_skill_source(&source, &skills_path)
-                        .with_context(|| format!("failed to install git skill source: {source}"))?;
+            let (installed_dir, files_scanned) = if let Some(skill_name) = skill.as_deref() {
+                if !is_git_source(&source) {
+                    anyhow::bail!(get_required_cli_string_with_args(
+                        "cli-skills-install-skill-requires-git",
+                        &[("source", &source)]
+                    ));
+                }
+                install_git_catalog_skill_source(
+                    &source,
+                    skill_name,
+                    &skills_path,
+                    config.skills.allow_scripts,
+                    workspace_dir,
+                )
+                .with_context(|| {
+                    get_required_cli_string_with_args(
+                        "cli-skills-install-catalog-failed",
+                        &[("skill", skill_name), ("source", &source)],
+                    )
+                })?
+            } else if is_git_source(&source) {
+                install_git_skill_source(&source, &skills_path, config.skills.allow_scripts)
+                    .with_context(|| {
+                        get_required_cli_string_with_args(
+                            "cli-skills-install-git-failed",
+                            &[("source", &source)],
+                        )
+                    })?
+            } else if is_registry_source(&source) {
                 println!(
-                    "  {} Skill installed and audited: {} ({} files scanned)",
-                    console::style("✓").green().bold(),
-                    installed_dir.display(),
-                    files_scanned
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-install-resolving-registry",
+                        &[("source", &source)]
+                    )
                 );
+                install_registry_skill_source(
+                    &source,
+                    &skills_path,
+                    config.skills.allow_scripts,
+                    workspace_dir,
+                    config.skills.registry_url.as_deref(),
+                    no_tier_banner,
+                )
+                .with_context(|| {
+                    get_required_cli_string_with_args(
+                        "cli-skills-install-registry-failed",
+                        &[("source", &source)],
+                    )
+                })?
+            } else if is_extra_registry_source(&source) {
+                // `is_extra_registry_source` is `parse_extra_registry_source(..).is_some()`,
+                // so this re-parse always succeeds. `unwrap_or_default` only guards an
+                // unreachable `None` for a cosmetic label rather than panicking in the CLI.
+                let registry_label = parse_extra_registry_source(&source)
+                    .map(|(name, _)| name)
+                    .unwrap_or_default();
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-install-resolving-extra-registry",
+                        &[("source", &source), ("registry", &registry_label)]
+                    )
+                );
+                install_extra_registry_skill_source(
+                    &source,
+                    &skills_path,
+                    config.skills.allow_scripts,
+                    workspace_dir,
+                    &config.skills.extra_registries,
+                    no_tier_banner,
+                )
+                .with_context(|| {
+                    get_required_cli_string_with_args(
+                        "cli-skills-install-extra-registry-failed",
+                        &[("source", &source)],
+                    )
+                })?
             } else {
-                let (dest, files_scanned) = install_local_skill_source(&source, &skills_path)
-                    .with_context(|| format!("failed to install local skill source: {source}"))?;
-                println!(
-                    "  {} Skill installed and audited: {} ({} files scanned)",
-                    console::style("✓").green().bold(),
-                    dest.display(),
-                    files_scanned
-                );
-            }
+                install_local_skill_source(&source, &skills_path, config.skills.allow_scripts)
+                    .with_context(|| {
+                        get_required_cli_string_with_args(
+                            "cli-skills-install-local-failed",
+                            &[("source", &source)],
+                        )
+                    })?
+            };
+            let status = console::style("✓").green().bold().to_string();
+            let installed_path = installed_dir.display().to_string();
+            let files_scanned = files_scanned.to_string();
+            println!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-skills-install-installed-audited",
+                    &[
+                        ("status", &status),
+                        ("path", &installed_path),
+                        ("files", &files_scanned)
+                    ]
+                )
+            );
 
-            println!("  Security audit completed successfully.");
+            println!(
+                "{}",
+                get_required_cli_string("cli-skills-install-security-audit-completed")
+            );
+
+            // Tell the user whether the skill is in a loadable location.
+            match &location {
+                SkillLocation::Bundle { alias, .. } => println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-install-into-bundle",
+                        &[("alias", alias)],
+                    )
+                ),
+                SkillLocation::Global { .. } => println!(
+                    "{}",
+                    get_required_cli_string("cli-skills-install-global-note")
+                ),
+            }
             Ok(())
         }
-        crate::SkillCommands::Remove { name } => {
+        crate::SkillCommands::Remove {
+            name,
+            agent,
+            bundle,
+        } => {
             // Reject path traversal attempts
             if name.contains("..") || name.contains('/') || name.contains('\\') {
                 anyhow::bail!("Invalid skill name: {name}");
             }
+            let status = console::style("✓").green().bold().to_string();
 
-            let skill_path = skills_dir(workspace_dir).join(&name);
+            if let Some(ref a) = agent
+                && config.agent(a).is_none()
+            {
+                anyhow::bail!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-agent-not-configured",
+                        &[("alias", a)],
+                    )
+                );
+            }
 
-            // Verify the resolved path is actually inside the skills directory
-            let canonical_skills = skills_dir(workspace_dir)
-                .canonicalize()
-                .unwrap_or_else(|_| skills_dir(workspace_dir));
-            if let Ok(canonical_skill) = skill_path.canonicalize() {
-                if !canonical_skill.starts_with(&canonical_skills) {
-                    anyhow::bail!("Skill path escapes skills directory: {name}");
+            // Explicit bundle: archive through the service (recoverable).
+            if let Some(ref b) = bundle {
+                let service = SkillsService::new(config, config.install_root_dir());
+                let target = service
+                    .resolve_ref(&name, Some(b))
+                    .map_err(anyhow::Error::msg)?;
+                service
+                    .remove_skill(&target, zeroclaw_runtime::skills::RemoveMode::Archive)
+                    .map_err(anyhow::Error::msg)?;
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-removed-archived",
+                        &[("status", &status), ("name", &name), ("bundle", b)],
+                    )
+                );
+                return Ok(());
+            }
+
+            // Otherwise locate the skill across bundles (+ global) and disambiguate.
+            let matches = collect_skill_locations(config, &name, agent.as_deref());
+            match matches.as_slice() {
+                [] => anyhow::bail!("Skill not found: {name}"),
+                [(label, dir)] => {
+                    if let Some(alias) = label.strip_prefix("bundle:") {
+                        let service = SkillsService::new(config, config.install_root_dir());
+                        let target = service
+                            .resolve_ref(&name, Some(alias))
+                            .map_err(anyhow::Error::msg)?;
+                        service
+                            .remove_skill(&target, zeroclaw_runtime::skills::RemoveMode::Archive)
+                            .map_err(anyhow::Error::msg)?;
+                        println!(
+                            "{}",
+                            get_required_cli_string_with_args(
+                                "cli-skills-removed-archived",
+                                &[("status", &status), ("name", &name), ("bundle", alias)],
+                            )
+                        );
+                    } else {
+                        // Global dir: plain delete with a containment guard.
+                        let global_root = skills_dir(&config.data_dir);
+                        let canonical_root =
+                            global_root.canonicalize().unwrap_or(global_root.clone());
+                        if let Ok(c) = dir.canonicalize()
+                            && !c.starts_with(&canonical_root)
+                        {
+                            anyhow::bail!("Skill path escapes skills directory: {name}");
+                        }
+                        std::fs::remove_dir_all(dir)?;
+                        println!(
+                            "{}",
+                            get_required_cli_string_with_args(
+                                "cli-skills-removed-global",
+                                &[("status", &status), ("name", &name)],
+                            )
+                        );
+                    }
+                }
+                many => {
+                    let locs = many
+                        .iter()
+                        .map(|(l, _)| l.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    anyhow::bail!(
+                        "{}",
+                        get_required_cli_string_with_args(
+                            "cli-skills-multiple-locations-bundle",
+                            &[("name", &name), ("locations", &locs)],
+                        )
+                    );
                 }
             }
-
-            if !skill_path.exists() {
-                anyhow::bail!("Skill not found: {name}");
+            Ok(())
+        }
+        crate::SkillCommands::Add {
+            name,
+            bundle,
+            description,
+            license,
+            author,
+            version,
+            category,
+            no_scaffold,
+            edit,
+        } => handle_add(
+            config,
+            name,
+            bundle,
+            description,
+            license,
+            author,
+            version,
+            category,
+            no_scaffold,
+            edit,
+        ),
+        crate::SkillCommands::Edit { name, bundle, file } => {
+            handle_edit(config, name, bundle, file)
+        }
+        crate::SkillCommands::Bundle { bundle_command } => match bundle_command {
+            crate::SkillBundleCommands::List => handle_bundle_list(config),
+            crate::SkillBundleCommands::Add { alias, directory } => {
+                Box::pin(handle_bundle_add(config, alias, directory)).await
             }
+            crate::SkillBundleCommands::Remove { alias, yes } => {
+                Box::pin(handle_bundle_remove(config, alias, yes)).await
+            }
+            crate::SkillBundleCommands::Rename { from, to } => {
+                Box::pin(handle_bundle_rename(config, from, to)).await
+            }
+            crate::SkillBundleCommands::Show { alias } => handle_bundle_show(config, alias),
+        },
+        crate::SkillCommands::Test { name, verbose } => {
+            let results = if let Some(ref skill_name) = name {
+                // Test a single skill
+                let source_path = PathBuf::from(skill_name);
+                let target = if source_path.exists() {
+                    source_path
+                } else {
+                    locate_installed_skill_dir(config, skill_name)?
+                };
 
-            std::fs::remove_dir_all(&skill_path)?;
-            println!(
-                "  {} Skill '{}' removed.",
-                console::style("✓").green().bold(),
-                name
-            );
+                let r = testing::test_skill(&target, skill_name, verbose)?;
+                if r.tests_run == 0 {
+                    println!(
+                        "  {} No TEST.sh found for skill '{}'.",
+                        console::style("-").dim(),
+                        skill_name,
+                    );
+                    return Ok(());
+                }
+                vec![r]
+            } else {
+                // Test all skills across every bundle plus the global dir.
+                let install_root = config.install_root_dir();
+                let mut dirs: Vec<PathBuf> = config
+                    .skill_bundles
+                    .keys()
+                    .filter_map(|a| {
+                        zeroclaw_config::skill_bundles::resolve_directory(config, &install_root, a)
+                            .ok()
+                    })
+                    .collect();
+                dirs.push(skills_dir(&config.data_dir));
+                testing::test_all_skills(&dirs, verbose)?
+            };
+
+            testing::print_results(&results);
+
+            let any_failed = results.iter().any(|r| !r.failures.is_empty());
+            if any_failed {
+                anyhow::bail!("Some skill tests failed.");
+            }
             Ok(())
         }
     }
 }
 
-#[cfg(test)]
-#[allow(clippy::similar_names)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::sync::{Mutex, OnceLock};
+enum SkillLocation {
+    Bundle { alias: String, dir: PathBuf },
+    Global { dir: PathBuf },
+}
 
-    fn open_skills_env_lock() -> &'static Mutex<()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    struct EnvVarGuard {
-        key: &'static str,
-        original: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn unset(key: &'static str) -> Self {
-            let original = std::env::var(key).ok();
-            std::env::remove_var(key);
-            Self { key, original }
+impl SkillLocation {
+    fn dir(&self) -> &Path {
+        match self {
+            SkillLocation::Bundle { dir, .. } | SkillLocation::Global { dir } => dir,
         }
     }
+}
 
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            if let Some(value) = &self.original {
-                std::env::set_var(self.key, value);
-            } else {
-                std::env::remove_var(self.key);
+/// Resolve where `skills install` should write. Precedence: an explicit
+/// `--bundle`, then the target agent's single assigned bundle, then the global
+/// fallback dir. `--agent` selects the target agent (default: the active agent).
+fn resolve_install_location(
+    config: &crate::config::Config,
+    agent: Option<&str>,
+    bundle: Option<&str>,
+) -> Result<SkillLocation> {
+    let install_root = config.install_root_dir();
+
+    // Validate an explicit --agent up front, so a typo'd alias errors even when
+    // --bundle is also given (which otherwise returns before the agent block).
+    if let Some(a) = agent
+        && config.agent(a).is_none()
+    {
+        anyhow::bail!(
+            "{}",
+            get_required_cli_string_with_args("cli-skills-agent-not-configured", &[("alias", a)],)
+        );
+    }
+
+    // 1. An explicit bundle wins outright (mirrors `skills add`/`edit`).
+    if let Some(alias) = bundle {
+        if !config.skill_bundles.contains_key(alias) {
+            anyhow::bail!(
+                "{}",
+                get_required_cli_string_with_args("cli-bundle-not-configured", &[("alias", alias)])
+            );
+        }
+        let dir = zeroclaw_config::skill_bundles::resolve_directory(config, &install_root, alias)
+            .map_err(anyhow::Error::msg)?;
+        return Ok(SkillLocation::Bundle {
+            alias: alias.to_string(),
+            dir,
+        });
+    }
+
+    // 2. Pick the target agent: explicit `--agent`, else the active agent.
+    let target_agent: Option<String> = match agent {
+        Some(a) => Some(a.to_string()),
+        None => config.resolved_runtime_agent_alias().map(str::to_string),
+    };
+
+    // 3. Derive the destination from that agent's assigned bundles.
+    if let Some(alias) = target_agent.as_deref()
+        && let Some(agent_cfg) = config.agent(alias)
+    {
+        match agent_cfg.skill_bundles.as_slice() {
+            [one] => {
+                let dir =
+                    zeroclaw_config::skill_bundles::resolve_directory(config, &install_root, one)
+                        .map_err(anyhow::Error::msg)?;
+                return Ok(SkillLocation::Bundle {
+                    alias: one.clone(),
+                    dir,
+                });
+            }
+            [] => {} // no bundle assigned — fall through to the global dir
+            many => {
+                let bundles = many.join(", ");
+                anyhow::bail!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-agent-multiple-bundles",
+                        &[("alias", alias), ("bundles", bundles.as_str())],
+                    )
+                );
             }
         }
     }
 
-    #[test]
-    fn load_empty_skills_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let skills = load_skills(dir.path());
-        assert!(skills.is_empty());
+    // 4. Global fallback — installed but not auto-loaded (caller prints a note).
+    Ok(SkillLocation::Global {
+        dir: skills_dir(&config.data_dir),
+    })
+}
+
+/// Every location (bundle dirs + the global dir) that contains a skill named
+/// `name`, as `(label, skill-dir)` pairs. Bundle labels are `bundle:<alias>`;
+/// the global dir is `global`. `agent_filter` restricts the bundle search to
+/// the bundles assigned to that agent (and drops the global dir).
+fn collect_skill_locations(
+    config: &crate::config::Config,
+    name: &str,
+    agent_filter: Option<&str>,
+) -> Vec<(String, PathBuf)> {
+    let install_root = config.install_root_dir();
+    let allowed: Option<Vec<String>> =
+        agent_filter.and_then(|a| config.agent(a).map(|c| c.skill_bundles.clone()));
+
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
+    for alias in config.skill_bundles.keys() {
+        if let Some(ref allow) = allowed
+            && !allow.contains(alias)
+        {
+            continue;
+        }
+        if let Ok(dir) =
+            zeroclaw_config::skill_bundles::resolve_directory(config, &install_root, alias)
+        {
+            let candidate = dir.join(name);
+            if candidate.is_dir() {
+                out.push((format!("bundle:{alias}"), candidate));
+            }
+        }
     }
-
-    #[test]
-    fn load_skill_from_toml() {
-        let dir = tempfile::tempdir().unwrap();
-        let skills_dir = dir.path().join("skills");
-        let skill_dir = skills_dir.join("test-skill");
-        fs::create_dir_all(&skill_dir).unwrap();
-
-        fs::write(
-            skill_dir.join("SKILL.toml"),
-            r#"
-[skill]
-name = "test-skill"
-description = "A test skill"
-version = "1.0.0"
-tags = ["test"]
-
-[[tools]]
-name = "hello"
-description = "Says hello"
-kind = "shell"
-command = "echo hello"
-"#,
-        )
-        .unwrap();
-
-        let skills = load_skills(dir.path());
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].name, "test-skill");
-        assert_eq!(skills[0].tools.len(), 1);
-        assert_eq!(skills[0].tools[0].name, "hello");
+    if agent_filter.is_none() {
+        let global = skills_dir(&config.data_dir).join(name);
+        if global.is_dir() {
+            out.push(("global".to_string(), global));
+        }
     }
+    out
+}
 
-    #[test]
-    fn load_skill_from_md() {
-        let dir = tempfile::tempdir().unwrap();
-        let skills_dir = dir.path().join("skills");
-        let skill_dir = skills_dir.join("md-skill");
-        fs::create_dir_all(&skill_dir).unwrap();
-
-        fs::write(
-            skill_dir.join("SKILL.md"),
-            "# My Skill\nThis skill does cool things.\n",
-        )
-        .unwrap();
-
-        let skills = load_skills(dir.path());
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].name, "md-skill");
-        assert!(skills[0].description.contains("cool things"));
-    }
-
-    #[test]
-    fn skills_to_prompt_empty() {
-        let prompt = skills_to_prompt(&[], Path::new("/tmp"));
-        assert!(prompt.is_empty());
-    }
-
-    #[test]
-    fn skills_to_prompt_with_skills() {
-        let skills = vec![Skill {
-            name: "test".to_string(),
-            description: "A test".to_string(),
-            version: "1.0.0".to_string(),
-            author: None,
-            tags: vec![],
-            tools: vec![],
-            prompts: vec!["Do the thing.".to_string()],
-            location: None,
-        }];
-        let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
-        assert!(prompt.contains("<available_skills>"));
-        assert!(prompt.contains("<name>test</name>"));
-        assert!(prompt.contains("<instruction>Do the thing.</instruction>"));
-    }
-
-    #[test]
-    fn skills_to_prompt_compact_mode_omits_instructions_and_tools() {
-        let skills = vec![Skill {
-            name: "test".to_string(),
-            description: "A test".to_string(),
-            version: "1.0.0".to_string(),
-            author: None,
-            tags: vec![],
-            tools: vec![SkillTool {
-                name: "run".to_string(),
-                description: "Run task".to_string(),
-                kind: "shell".to_string(),
-                command: "echo hi".to_string(),
-                args: HashMap::new(),
-            }],
-            prompts: vec!["Do the thing.".to_string()],
-            location: Some(PathBuf::from("/tmp/workspace/skills/test/SKILL.md")),
-        }];
-        let prompt = skills_to_prompt_with_mode(
-            &skills,
-            Path::new("/tmp/workspace"),
-            crate::config::SkillsPromptInjectionMode::Compact,
-        );
-
-        assert!(prompt.contains("<available_skills>"));
-        assert!(prompt.contains("<name>test</name>"));
-        assert!(prompt.contains("<location>skills/test/SKILL.md</location>"));
-        assert!(prompt.contains("loaded on demand"));
-        assert!(!prompt.contains("<instructions>"));
-        assert!(!prompt.contains("<instruction>Do the thing.</instruction>"));
-        assert!(!prompt.contains("<tools>"));
-    }
-
-    #[test]
-    fn init_skills_creates_readme() {
-        let dir = tempfile::tempdir().unwrap();
-        init_skills_dir(dir.path()).unwrap();
-        assert!(dir.path().join("skills").join("README.md").exists());
-    }
-
-    #[test]
-    fn init_skills_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        init_skills_dir(dir.path()).unwrap();
-        init_skills_dir(dir.path()).unwrap(); // second call should not fail
-        assert!(dir.path().join("skills").join("README.md").exists());
-    }
-
-    #[test]
-    fn load_nonexistent_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let fake = dir.path().join("nonexistent");
-        let skills = load_skills(&fake);
-        assert!(skills.is_empty());
-    }
-
-    #[test]
-    fn load_ignores_files_in_skills_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let skills_dir = dir.path().join("skills");
-        fs::create_dir_all(&skills_dir).unwrap();
-        // A file, not a directory — should be ignored
-        fs::write(skills_dir.join("not-a-skill.txt"), "hello").unwrap();
-        let skills = load_skills(dir.path());
-        assert!(skills.is_empty());
-    }
-
-    #[test]
-    fn load_ignores_dir_without_manifest() {
-        let dir = tempfile::tempdir().unwrap();
-        let skills_dir = dir.path().join("skills");
-        let empty_skill = skills_dir.join("empty-skill");
-        fs::create_dir_all(&empty_skill).unwrap();
-        // Directory exists but no SKILL.toml or SKILL.md
-        let skills = load_skills(dir.path());
-        assert!(skills.is_empty());
-    }
-
-    #[test]
-    fn load_multiple_skills() {
-        let dir = tempfile::tempdir().unwrap();
-        let skills_dir = dir.path().join("skills");
-
-        for name in ["alpha", "beta", "gamma"] {
-            let skill_dir = skills_dir.join(name);
-            fs::create_dir_all(&skill_dir).unwrap();
-            fs::write(
-                skill_dir.join("SKILL.md"),
-                format!("# {name}\nSkill {name} description.\n"),
+/// Locate a single installed skill directory by name (across bundles + global),
+/// erroring when absent or ambiguous. Used by `audit`/`test`.
+fn locate_installed_skill_dir(config: &crate::config::Config, name: &str) -> Result<PathBuf> {
+    let mut matches = collect_skill_locations(config, name, None);
+    match matches.len() {
+        0 => anyhow::bail!("Skill not found: {name}"),
+        1 => Ok(matches.remove(0).1),
+        _ => {
+            let locs = matches
+                .iter()
+                .map(|(label, _)| label.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-skills-multiple-locations-path",
+                    &[("name", name), ("locations", &locs)],
+                )
             )
-            .unwrap();
         }
-
-        let skills = load_skills(dir.path());
-        assert_eq!(skills.len(), 3);
     }
+}
 
-    #[test]
-    fn toml_skill_with_multiple_tools() {
-        let dir = tempfile::tempdir().unwrap();
-        let skills_dir = dir.path().join("skills");
-        let skill_dir = skills_dir.join("multi-tool");
-        fs::create_dir_all(&skill_dir).unwrap();
+/// Render one skill row for `skills list` (name + version + tools + tags).
+fn print_skill(skill: &Skill) {
+    println!(
+        "  {} {} — {}",
+        console::style(&skill.name).white().bold(),
+        console::style(format!("v{}", skill.version)).dim(),
+        skill.description
+    );
+    if !skill.tools.is_empty() {
+        println!(
+            "    Tools: {}", // i18n-exempt: "Tools" label mirrors existing list output
+            skill
+                .tools
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !skill.tags.is_empty() {
+        println!(
+            "    {}",
+            get_required_cli_string_with_args(
+                "cli-skills-tags",
+                &[("tags", &skill.tags.join(", "))],
+            )
+        );
+    }
+}
 
-        fs::write(
-            skill_dir.join("SKILL.toml"),
-            r#"
-[skill]
-name = "multi-tool"
-description = "Has many tools"
-version = "2.0.0"
-author = "tester"
-tags = ["automation", "devops"]
+#[allow(clippy::too_many_arguments)]
+fn handle_add(
+    config: &crate::config::Config,
+    name: String,
+    bundle: Option<String>,
+    description: Option<String>,
+    license: Option<String>,
+    author: Option<String>,
+    version: Option<String>,
+    category: Option<String>,
+    no_scaffold: bool,
+    edit: bool,
+) -> Result<()> {
+    let install_root = config.install_root_dir();
+    let service = SkillsService::new(config, install_root);
+    let target = service
+        .resolve_ref(&name, bundle.as_deref())
+        .context("failed to resolve bundle target for skill add")?;
 
-[[tools]]
-name = "build"
-description = "Build the project"
-kind = "shell"
-command = "cargo build"
+    let description = prompt_for_description(description)?;
+    let frontmatter = SkillFrontmatter {
+        name: target.name().to_string(),
+        description,
+        license,
+        author,
+        version: Some(version.unwrap_or_else(|| "0.1.0".to_string())),
+        category,
+        // Scaffold creates a tagless skill; tags (including the `slash` opt-in
+        // slash commands) are managed in the dashboard skills editor.
+        tags: Vec::new(),
+        // Slash options are authored in the dashboard editor, not at scaffold time.
+        slash_options: Vec::new(),
+        // Scaffolded skills load on demand; always-inject is opt-in via the editor.
+        always: false,
+    };
 
-[[tools]]
-name = "test"
-description = "Run tests"
-kind = "shell"
-command = "cargo test"
+    let skill_dir = service.scaffold_skill(
+        &target,
+        frontmatter,
+        ScaffoldOptions {
+            create_optional_subdirs: !no_scaffold,
+            body: String::new(),
+        },
+    )?;
 
-[[tools]]
-name = "deploy"
-description = "Deploy via HTTP"
-kind = "http"
-command = "https://api.example.com/deploy"
-"#,
+    println!(
+        "{}",
+        zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "cli-skills-add-scaffolded",
+            &[
+                ("target", &target.to_string()),
+                ("dir", &skill_dir.display().to_string()),
+            ],
         )
-        .unwrap();
+    );
 
-        let skills = load_skills(dir.path());
-        assert_eq!(skills.len(), 1);
-        let s = &skills[0];
-        assert_eq!(s.name, "multi-tool");
-        assert_eq!(s.version, "2.0.0");
-        assert_eq!(s.author.as_deref(), Some("tester"));
-        assert_eq!(s.tags, vec!["automation", "devops"]);
-        assert_eq!(s.tools.len(), 3);
-        assert_eq!(s.tools[0].name, "build");
-        assert_eq!(s.tools[1].kind, "shell");
-        assert_eq!(s.tools[2].kind, "http");
+    if edit {
+        open_in_editor(
+            &skill_dir.join(zeroclaw_runtime::skills::constants::SKILL_MANIFEST_FILENAME),
+        )?;
     }
+    Ok(())
+}
 
-    #[test]
-    fn toml_skill_minimal() {
-        let dir = tempfile::tempdir().unwrap();
-        let skills_dir = dir.path().join("skills");
-        let skill_dir = skills_dir.join("minimal");
-        fs::create_dir_all(&skill_dir).unwrap();
+fn handle_edit(
+    config: &crate::config::Config,
+    name: String,
+    bundle: Option<String>,
+    file: Option<String>,
+) -> Result<()> {
+    let install_root = config.install_root_dir();
+    let service = SkillsService::new(config, install_root);
+    let target = service.resolve_ref(&name, bundle.as_deref())?;
 
-        fs::write(
-            skill_dir.join("SKILL.toml"),
-            r#"
-[skill]
-name = "minimal"
-description = "Bare minimum"
-"#,
-        )
-        .unwrap();
+    let summary = service
+        .list_skills(Some(target.bundle()))?
+        .into_iter()
+        .find(|s| s.r#ref.name() == target.name())
+        .ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"skill_ref": target.to_string()})),
+                "skill show: target ref not found"
+            );
+            anyhow::Error::msg(format!("skill '{target}' not found"))
+        })?;
 
-        let skills = load_skills(dir.path());
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].version, "0.1.0"); // default version
-        assert!(skills[0].author.is_none());
-        assert!(skills[0].tags.is_empty());
-        assert!(skills[0].tools.is_empty());
+    let path = match file {
+        Some(rel) => summary.directory.join(rel),
+        None => summary
+            .directory
+            .join(zeroclaw_runtime::skills::constants::SKILL_MANIFEST_FILENAME),
+    };
+    if !path.exists() {
+        anyhow::bail!("file not found: {}", path.display());
     }
+    open_in_editor(&path)
+}
 
-    #[test]
-    fn toml_skill_invalid_syntax_skipped() {
-        let dir = tempfile::tempdir().unwrap();
-        let skills_dir = dir.path().join("skills");
-        let skill_dir = skills_dir.join("broken");
-        fs::create_dir_all(&skill_dir).unwrap();
-
-        fs::write(skill_dir.join("SKILL.toml"), "this is not valid toml {{{{").unwrap();
-
-        let skills = load_skills(dir.path());
-        assert!(skills.is_empty()); // broken skill is skipped
+/// Create a skill bundle: insert the config entry, set a custom directory if
+/// given, materialize the resolved directory, and persist.
+async fn handle_bundle_add(
+    config: &crate::config::Config,
+    alias: String,
+    directory: Option<String>,
+) -> Result<()> {
+    let mut working = config.clone();
+    if !working
+        .create_map_key("skill_bundles", &alias)
+        .map_err(anyhow::Error::msg)?
+    {
+        println!(
+            "{}",
+            mta(
+                "cli-bundle-exists",
+                &[("alias", alias.as_str())],
+                "skill bundle '{$alias}' already exists (no change)"
+            )
+        );
+        return Ok(());
     }
-
-    #[test]
-    fn md_skill_heading_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let skills_dir = dir.path().join("skills");
-        let skill_dir = skills_dir.join("heading-only");
-        fs::create_dir_all(&skill_dir).unwrap();
-
-        fs::write(skill_dir.join("SKILL.md"), "# Just a Heading\n").unwrap();
-
-        let skills = load_skills(dir.path());
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].description, "No description");
+    if let Some(dir) = directory.as_ref()
+        && let Some(b) = working.skill_bundles.get_mut(&alias)
+    {
+        b.directory = Some(dir.clone());
     }
-
-    #[test]
-    fn skills_to_prompt_includes_tools() {
-        let skills = vec![Skill {
-            name: "weather".to_string(),
-            description: "Get weather".to_string(),
-            version: "1.0.0".to_string(),
-            author: None,
-            tags: vec![],
-            tools: vec![SkillTool {
-                name: "get_weather".to_string(),
-                description: "Fetch forecast".to_string(),
-                kind: "shell".to_string(),
-                command: "curl wttr.in".to_string(),
-                args: HashMap::new(),
-            }],
-            prompts: vec![],
-            location: None,
-        }];
-        let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
-        assert!(prompt.contains("weather"));
-        assert!(prompt.contains("<name>get_weather</name>"));
-        assert!(prompt.contains("<description>Fetch forecast</description>"));
-        assert!(prompt.contains("<kind>shell</kind>"));
-    }
-
-    #[test]
-    fn skills_to_prompt_escapes_xml_content() {
-        let skills = vec![Skill {
-            name: "xml<skill>".to_string(),
-            description: "A & B".to_string(),
-            version: "1.0.0".to_string(),
-            author: None,
-            tags: vec![],
-            tools: vec![],
-            prompts: vec!["Use <tool> & check \"quotes\".".to_string()],
-            location: None,
-        }];
-
-        let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
-        assert!(prompt.contains("<name>xml&lt;skill&gt;</name>"));
-        assert!(prompt.contains("<description>A &amp; B</description>"));
-        assert!(prompt.contains(
-            "<instruction>Use &lt;tool&gt; &amp; check &quot;quotes&quot;.</instruction>"
-        ));
-    }
-
-    #[test]
-    fn git_source_detection_accepts_remote_protocols_and_scp_style() {
-        let sources = [
-            "https://github.com/some-org/some-skill.git",
-            "http://github.com/some-org/some-skill.git",
-            "ssh://git@github.com/some-org/some-skill.git",
-            "git://github.com/some-org/some-skill.git",
-            "git@github.com:some-org/some-skill.git",
-            "git@localhost:skills/some-skill.git",
-        ];
-
-        for source in sources {
-            assert!(
-                is_git_source(source),
-                "expected git source detection for '{source}'"
+    working.mark_dirty(&format!("skill_bundles.{alias}"));
+    let install_root = working.install_root_dir();
+    match zeroclaw_config::skill_bundles::resolve_directory(&working, &install_root, &alias) {
+        Ok(dir) => {
+            tokio::fs::create_dir_all(&dir).await.ok();
+            let d = dir.display().to_string();
+            println!(
+                "{}",
+                mta(
+                    "cli-bundle-created",
+                    &[("alias", alias.as_str()), ("dir", d.as_str())],
+                    "created skill_bundles.{$alias} (dir: {$dir})"
+                )
+            );
+        }
+        Err(e) => {
+            let es = e.to_string();
+            println!(
+                "{}",
+                mta(
+                    "cli-bundle-created-warn",
+                    &[("alias", alias.as_str()), ("error", es.as_str())],
+                    "created skill_bundles.{$alias} (warning: dir resolve failed: {$error})"
+                )
             );
         }
     }
+    Box::pin(working.save_dirty())
+        .await
+        .context("failed to persist config")
+}
 
-    #[test]
-    fn git_source_detection_rejects_local_paths_and_invalid_inputs() {
-        let sources = [
-            "./skills/local-skill",
-            "/tmp/skills/local-skill",
-            "C:\\skills\\local-skill",
-            "git@github.com",
-            "ssh://",
-            "not-a-url",
-            "dir/git@github.com:org/repo.git",
-        ];
+/// Delete a skill bundle: archive its directory, strip it from every agent's
+/// `skill_bundles` list, remove the config entry, and persist. Safe-by-default:
+/// without `--yes` it prints the impact and makes no change.
+async fn handle_bundle_remove(
+    config: &crate::config::Config,
+    alias: String,
+    yes: bool,
+) -> Result<()> {
+    let exists = config
+        .get_map_keys("skill_bundles")
+        .is_some_and(|k| k.contains(&alias));
+    if !exists {
+        anyhow::bail!(
+            "{}",
+            mta(
+                "cli-bundle-not-configured",
+                &[("alias", alias.as_str())],
+                "skill bundle '{$alias}' is not configured"
+            )
+        );
+    }
+    let refs = zeroclaw_config::alias_refs::find_bundle_refs(config, &alias);
+    if !yes {
+        let count = refs.len().to_string();
+        println!(
+            "{}",
+            mta(
+                "cli-bundle-impact-header",
+                &[("alias", alias.as_str()), ("count", count.as_str())],
+                "deleting skill_bundles.{$alias} would strip it from {$count} agent reference(s):"
+            )
+        );
+        for r in &refs {
+            println!("  • {}", r.path);
+        }
+        println!(
+            "\n{}",
+            mt(
+                "cli-bundle-no-changes",
+                "No changes made. Re-run with --yes to apply."
+            )
+        );
+        return Ok(());
+    }
+    let mut working = config.clone();
+    let install_root = working.install_root_dir();
+    // Resolve the bundle directory while the entry still exists, so it can be
+    // archived AFTER the config change is durable.
+    let bundle_dir =
+        zeroclaw_config::skill_bundles::resolve_directory(&working, &install_root, &alias)
+            .ok()
+            .filter(|d| d.exists());
 
-        for source in sources {
-            assert!(
-                !is_git_source(source),
-                "expected local/invalid source detection for '{source}'"
+    // Mutate + PERSIST the config first, so a later archive failure can't leave
+    // the config pointing at a directory already moved to _deleted/.
+    let mut dirty = zeroclaw_config::alias_refs::scrub_bundle_refs(&mut working, &alias);
+    working
+        .delete_map_key("skill_bundles", &alias)
+        .map_err(anyhow::Error::msg)?;
+    dirty.push(format!("skill_bundles.{alias}"));
+    for p in &dirty {
+        working.mark_dirty(p);
+    }
+    Box::pin(working.save_dirty())
+        .await
+        .context("failed to persist config")?;
+
+    // Archive the bundle directory under shared/skills/_deleted/ (the runtime
+    // skips that path, so it isn't re-scanned as live skills) now that the
+    // config change is on disk.
+    if let Some(dir) = bundle_dir {
+        let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
+        let archive = install_root
+            .join("shared")
+            .join("skills")
+            .join("_deleted")
+            .join(format!("{alias}-{ts}"));
+        if let Some(p) = archive.parent() {
+            tokio::fs::create_dir_all(p).await.ok();
+        }
+        match tokio::fs::rename(&dir, &archive).await {
+            Ok(()) => {
+                let p = archive.display().to_string();
+                println!(
+                    "{}",
+                    mta(
+                        "cli-bundle-archived",
+                        &[("path", p.as_str())],
+                        "archived bundle directory → {$path}"
+                    )
+                );
+            }
+            Err(e) => {
+                let es = e.to_string();
+                eprintln!(
+                    "{}",
+                    mta(
+                        "cli-bundle-warn-archive",
+                        &[("error", es.as_str())],
+                        "warning: bundle directory archive failed: {$error}"
+                    )
+                );
+            }
+        }
+    }
+    let count = refs.len().to_string();
+    println!(
+        "{}",
+        mta(
+            "cli-bundle-deleted",
+            &[("alias", alias.as_str()), ("count", count.as_str())],
+            "deleted skill_bundles.{$alias} (stripped from {$count} agent(s))"
+        )
+    );
+    Ok(())
+}
+
+/// Rename a skill bundle: rename the config entry, rewrite every agent's
+/// `skill_bundles` reference, move its directory, and persist.
+async fn handle_bundle_rename(
+    config: &crate::config::Config,
+    from: String,
+    to: String,
+) -> Result<()> {
+    let mut working = config.clone();
+    let install_root = working.install_root_dir();
+    // Resolve the OLD directory while the `from` entry still exists.
+    let old_dir =
+        zeroclaw_config::skill_bundles::resolve_directory(&working, &install_root, &from).ok();
+    match working.rename_map_key("skill_bundles", &from, &to) {
+        Ok(true) => {}
+        Ok(false) => anyhow::bail!(
+            "{}",
+            mta(
+                "cli-bundle-not-configured",
+                &[("alias", from.as_str())],
+                "skill bundle '{$alias}' is not configured"
+            )
+        ),
+        Err(e) => {
+            let es = e.to_string();
+            anyhow::bail!(
+                "{}",
+                mta(
+                    "cli-bundle-rename-failed",
+                    &[("error", es.as_str())],
+                    "rename failed: {$error}"
+                )
+            )
+        }
+    }
+    let mut dirty = zeroclaw_config::alias_refs::rewrite_bundle_refs(&mut working, &from, &to);
+    dirty.push(format!("skill_bundles.{from}"));
+    dirty.push(format!("skill_bundles.{to}"));
+    // Resolve the NEW directory (the entry now lives under `to`) for the move.
+    let new_dir =
+        zeroclaw_config::skill_bundles::resolve_directory(&working, &install_root, &to).ok();
+    for p in &dirty {
+        working.mark_dirty(p);
+    }
+    // PERSIST the config rename before moving the directory, so a later move
+    // failure can't leave the config naming `to` while the dir sits at `from`.
+    Box::pin(working.save_dirty())
+        .await
+        .context("failed to persist config")?;
+
+    // Move the directory (default per-alias path only; a custom path is
+    // alias-independent → old == new → skip).
+    if let (Some(old), Some(new)) = (old_dir, new_dir)
+        && old != new
+        && old.exists()
+    {
+        if let Some(p) = new.parent() {
+            tokio::fs::create_dir_all(p).await.ok();
+        }
+        if let Err(e) = tokio::fs::rename(&old, &new).await {
+            let es = e.to_string();
+            eprintln!(
+                "{}",
+                mta(
+                    "cli-bundle-warn-move",
+                    &[("error", es.as_str())],
+                    "warning: bundle directory move failed: {$error}"
+                )
             );
         }
     }
-
-    #[test]
-    fn skills_dir_path() {
-        let base = std::path::Path::new("/home/user/.zeroclaw");
-        let dir = skills_dir(base);
-        assert_eq!(dir, PathBuf::from("/home/user/.zeroclaw/skills"));
-    }
-
-    #[test]
-    fn toml_prefers_over_md() {
-        let dir = tempfile::tempdir().unwrap();
-        let skills_dir = dir.path().join("skills");
-        let skill_dir = skills_dir.join("dual");
-        fs::create_dir_all(&skill_dir).unwrap();
-
-        fs::write(
-            skill_dir.join("SKILL.toml"),
-            "[skill]\nname = \"from-toml\"\ndescription = \"TOML wins\"\n",
+    println!(
+        "{}",
+        mta(
+            "cli-bundle-renamed",
+            &[("from", from.as_str()), ("to", to.as_str())],
+            "renamed skill_bundles.{$from} → skill_bundles.{$to}"
         )
-        .unwrap();
-        fs::write(skill_dir.join("SKILL.md"), "# From MD\nMD description\n").unwrap();
+    );
+    Ok(())
+}
 
-        let skills = load_skills(dir.path());
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].name, "from-toml"); // TOML takes priority
-    }
-
-    #[test]
-    fn open_skills_enabled_resolution_prefers_env_then_config_then_default_false() {
-        assert!(!open_skills_enabled_from_sources(None, None));
-        assert!(open_skills_enabled_from_sources(Some(true), None));
-        assert!(!open_skills_enabled_from_sources(Some(true), Some("0")));
-        assert!(open_skills_enabled_from_sources(Some(false), Some("yes")));
-        // Invalid env values should fall back to config.
-        assert!(open_skills_enabled_from_sources(
-            Some(true),
-            Some("invalid")
-        ));
-        assert!(!open_skills_enabled_from_sources(
-            Some(false),
-            Some("invalid")
-        ));
-    }
-
-    #[test]
-    fn resolve_open_skills_dir_resolution_prefers_env_then_config_then_home() {
-        let home = Path::new("/tmp/home-dir");
-        assert_eq!(
-            resolve_open_skills_dir_from_sources(
-                Some("/tmp/env-skills"),
-                Some("/tmp/config"),
-                Some(home)
-            ),
-            Some(PathBuf::from("/tmp/env-skills"))
+fn print_bundle_include_exclude(include: &[String], exclude: &[String]) {
+    if !include.is_empty() {
+        println!(
+            "  {}",
+            zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "cli-skills-bundle-include",
+                &[("values", &include.join(", "))],
+            )
         );
-        assert_eq!(
-            resolve_open_skills_dir_from_sources(
-                Some("   "),
-                Some("/tmp/config-skills"),
-                Some(home)
-            ),
-            Some(PathBuf::from("/tmp/config-skills"))
-        );
-        assert_eq!(
-            resolve_open_skills_dir_from_sources(None, None, Some(home)),
-            Some(PathBuf::from("/tmp/home-dir/open-skills"))
-        );
-        assert_eq!(resolve_open_skills_dir_from_sources(None, None, None), None);
     }
+    if !exclude.is_empty() {
+        println!(
+            "  {}",
+            zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "cli-skills-bundle-exclude",
+                &[("values", &exclude.join(", "))],
+            )
+        );
+    }
+}
 
-    #[test]
-    fn load_skills_with_config_reads_open_skills_dir_without_network() {
-        let _env_guard = open_skills_env_lock().lock().unwrap();
-        let _enabled_guard = EnvVarGuard::unset("ZEROCLAW_OPEN_SKILLS_ENABLED");
-        let _dir_guard = EnvVarGuard::unset("ZEROCLAW_OPEN_SKILLS_DIR");
-
-        let dir = tempfile::tempdir().unwrap();
-        let workspace_dir = dir.path().join("workspace");
-        fs::create_dir_all(workspace_dir.join("skills")).unwrap();
-
-        let open_skills_dir = dir.path().join("open-skills-local");
-        fs::create_dir_all(open_skills_dir.join("skills/http_request")).unwrap();
-        fs::write(open_skills_dir.join("README.md"), "# open skills\n").unwrap();
-        fs::write(
-            open_skills_dir.join("CONTRIBUTING.md"),
-            "# contribution guide\n",
+fn handle_bundle_list(config: &crate::config::Config) -> Result<()> {
+    let install_root = config.install_root_dir();
+    let service = SkillsService::new(config, install_root);
+    let bundles = service.list_bundles()?;
+    if bundles.is_empty() {
+        println!(
+            "{}",
+            zeroclaw_runtime::i18n::get_required_cli_string("cli-skills-bundle-list-empty")
+        );
+        return Ok(());
+    }
+    println!(
+        "{}",
+        zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "cli-skills-bundle-list-header",
+            &[("count", &bundles.len().to_string())],
         )
-        .unwrap();
-        fs::write(
-            open_skills_dir.join("skills/http_request/SKILL.md"),
-            "# HTTP request\nFetch API responses.\n",
+    );
+    for b in &bundles {
+        println!(
+            "  {}",
+            zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "cli-skills-bundle-entry",
+                &[
+                    ("alias", &b.alias),
+                    ("dir", &b.directory.display().to_string()),
+                ],
+            )
+        );
+        print_bundle_include_exclude(&b.include, &b.exclude);
+    }
+    Ok(())
+}
+
+fn handle_bundle_show(config: &crate::config::Config, alias: String) -> Result<()> {
+    let install_root = config.install_root_dir();
+    let service = SkillsService::new(config, install_root);
+    let bundles = service.list_bundles()?;
+    let bundle = bundles
+        .into_iter()
+        .find(|b| b.alias == alias)
+        .ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"skill_bundle": alias})),
+                "skill bundle lookup failed: alias not in config"
+            );
+            anyhow::Error::msg(format!("skill bundle '{alias}' not configured"))
+        })?;
+
+    println!(
+        "{}",
+        zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "cli-skills-bundle-entry",
+            &[
+                ("alias", &bundle.alias),
+                ("dir", &bundle.directory.display().to_string()),
+            ],
         )
-        .unwrap();
+    );
+    print_bundle_include_exclude(&bundle.include, &bundle.exclude);
 
-        let mut config = crate::config::Config::default();
-        config.workspace_dir = workspace_dir.clone();
-        config.skills.open_skills_enabled = true;
-        config.skills.open_skills_dir = Some(open_skills_dir.to_string_lossy().to_string());
+    let skills = service.list_skills(Some(&alias))?;
+    if skills.is_empty() {
+        println!(
+            "  {}",
+            zeroclaw_runtime::i18n::get_required_cli_string("cli-skills-bundle-show-no-skills")
+        );
+    } else {
+        println!(
+            "  {}",
+            zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "cli-skills-bundle-show-skills-header",
+                &[("count", &skills.len().to_string())],
+            )
+        );
+        for s in &skills {
+            println!(
+                "    {}",
+                zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "cli-skills-bundle-show-skill",
+                    &[
+                        ("name", s.r#ref.name()),
+                        ("description", &s.frontmatter.description),
+                    ],
+                )
+            );
+        }
+    }
+    Ok(())
+}
 
-        let skills = load_skills_with_config(&workspace_dir, &config);
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].name, "http_request");
-        assert_ne!(skills[0].name, "CONTRIBUTING");
+fn prompt_for_description(description: Option<String>) -> Result<String> {
+    if let Some(d) = description
+        && !d.trim().is_empty()
+    {
+        return Ok(d);
+    }
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        let prompt: String = dialoguer::Input::new()
+            .with_prompt("Skill description (what it does, when to use it)")
+            .interact_text()?;
+        if prompt.trim().is_empty() {
+            anyhow::bail!("description must not be empty");
+        }
+        Ok(prompt)
+    } else {
+        anyhow::bail!("--description is required when stdin is not a TTY");
+    }
+}
+
+fn open_in_editor(path: &std::path::Path) -> Result<()> {
+    let Some(editor) = editor_from_env_or_path() else {
+        anyhow::bail!("no editor found; set VISUAL or EDITOR");
+    };
+    let status = std::process::Command::new(&editor).arg(path).status()?;
+    if !status.success() {
+        anyhow::bail!("{editor} exited with non-zero status");
+    }
+    Ok(())
+}
+
+fn editor_from_env_or_path() -> Option<String> {
+    std::env::var("VISUAL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .or_else(|| {
+            fallback_editors()
+                .iter()
+                .copied()
+                .find(|candidate| executable_on_path(candidate))
+                .map(str::to_string)
+        })
+}
+
+fn executable_on_path(name: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
+}
+
+fn fallback_editors() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["notepad.exe", "nano", "vim"]
+    } else {
+        &["nano", "vi", "vim", "editor"]
     }
 }
 
 #[cfg(test)]
-mod symlink_tests;
+mod install_location_tests {
+    use super::*;
+    use crate::config::{AliasedAgentConfig, Config};
+    use zeroclaw_config::schema::SkillBundleConfig;
+
+    fn config_with_bundles(aliases: &[&str]) -> Config {
+        let mut c = Config::default();
+        for alias in aliases {
+            c.skill_bundles
+                .insert((*alias).to_string(), SkillBundleConfig::default());
+        }
+        c
+    }
+
+    fn agent_with_bundles(bundles: &[&str]) -> AliasedAgentConfig {
+        AliasedAgentConfig {
+            skill_bundles: bundles.iter().map(|s| (*s).to_string()).collect(),
+            ..AliasedAgentConfig::default()
+        }
+    }
+
+    /// The `skills install`/`audit` error strings route through Fluent. Assert
+    /// the new `cli-skills-*` keys resolve (not the `{key}` missing-marker) and
+    /// interpolate their `{$source}` argument, so a code/ftl key rename can't
+    /// silently degrade these user-facing errors to a literal key. Uses the
+    /// locale-independent argument value as the resolution signal.
+    #[test]
+    fn install_error_strings_resolve_through_fluent() {
+        use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
+        let audit = get_required_cli_string("cli-skills-audit-failed");
+        assert!(
+            !audit.starts_with('{') && audit.contains("audit"),
+            "cli-skills-audit-failed did not resolve: {audit}"
+        );
+        for key in [
+            "cli-skills-install-git-failed",
+            "cli-skills-install-registry-failed",
+            "cli-skills-install-extra-registry-failed",
+            "cli-skills-install-local-failed",
+        ] {
+            let msg = get_required_cli_string_with_args(key, &[("source", "acme/widget")]);
+            assert!(
+                msg.contains("failed to install") && msg.contains("acme/widget"),
+                "{key} did not resolve/interpolate: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_bundle_wins() {
+        let c = config_with_bundles(&["official"]);
+        let loc = resolve_install_location(&c, None, Some("official")).unwrap();
+        assert!(matches!(loc, SkillLocation::Bundle { alias, .. } if alias == "official"));
+    }
+
+    #[test]
+    fn explicit_unknown_bundle_errors() {
+        let c = config_with_bundles(&["official"]);
+        assert!(resolve_install_location(&c, None, Some("ghost")).is_err());
+    }
+
+    #[test]
+    fn unknown_agent_errors() {
+        let c = config_with_bundles(&["official"]);
+        assert!(resolve_install_location(&c, Some("nobody"), None).is_err());
+    }
+
+    #[test]
+    fn no_agent_no_bundle_falls_back_to_global() {
+        let c = config_with_bundles(&["official"]);
+        let loc = resolve_install_location(&c, None, None).unwrap();
+        assert!(matches!(loc, SkillLocation::Global { .. }));
+    }
+
+    #[test]
+    fn default_agent_single_bundle_is_used() {
+        let mut c = config_with_bundles(&["team"]);
+        c.agents
+            .insert("default".to_string(), agent_with_bundles(&["team"]));
+        let loc = resolve_install_location(&c, None, None).unwrap();
+        assert!(matches!(loc, SkillLocation::Bundle { alias, .. } if alias == "team"));
+    }
+
+    #[test]
+    fn agent_with_multiple_bundles_requires_flag() {
+        let mut c = config_with_bundles(&["a", "b"]);
+        c.agents
+            .insert("default".to_string(), agent_with_bundles(&["a", "b"]));
+        assert!(resolve_install_location(&c, None, None).is_err());
+    }
+
+    #[test]
+    fn explicit_agent_without_bundle_falls_back_to_global() {
+        let mut c = Config::default();
+        c.agents
+            .insert("worker".to_string(), agent_with_bundles(&[]));
+        let loc = resolve_install_location(&c, Some("worker"), None).unwrap();
+        assert!(matches!(loc, SkillLocation::Global { .. }));
+    }
+
+    fn write_skill(dir: &Path, name: &str) {
+        let skill_dir = dir.join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            format!(
+                "[skill]\nname = \"{name}\"\ndescription = \"boundary test skill\"\nversion = \"0.1.0\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn default_install_destination_is_loaded_by_the_runtime() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let mut c = Config {
+            // install_root_dir() == config_path.parent() == root
+            config_path: root.join("config.toml"),
+            data_dir: root.join("data"),
+            ..Config::default()
+        };
+        c.skill_bundles
+            .insert("official".to_string(), SkillBundleConfig::default());
+        c.agents
+            .insert("default".to_string(), agent_with_bundles(&["official"]));
+
+        // Where `skills install` (no flags) would write for the default agent.
+        let loc = resolve_install_location(&c, None, None).unwrap();
+        let dest = match loc {
+            SkillLocation::Bundle { ref alias, ref dir } => {
+                assert_eq!(alias, "official");
+                dir.clone()
+            }
+            SkillLocation::Global { .. } => panic!("expected the agent's bundle, got global"),
+        };
+        write_skill(&dest, "loadable-skill");
+
+        // A skill left in the legacy global dir must NOT be loaded (the bug).
+        write_skill(&skills_dir(&c.data_dir), "orphaned-skill");
+
+        let loaded: Vec<String> = load_skills_for_agent_from_config(&c, "default")
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            loaded.iter().any(|n| n == "loadable-skill"),
+            "install destination must be loaded by the runtime; got {loaded:?}"
+        );
+        assert!(
+            !loaded.iter().any(|n| n == "orphaned-skill"),
+            "data/skills must NOT be loaded by the runtime (this was #8334); got {loaded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_command_then_runtime_loads_the_skill() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // A local skill source directory a user would `skills install`.
+        let source_parent = root.join("source");
+        write_skill(&source_parent, "e2e-skill");
+        let source = source_parent.join("e2e-skill");
+
+        let mut c = Config {
+            // install_root_dir() == config_path.parent() == root
+            config_path: root.join("config.toml"),
+            data_dir: root.join("data"),
+            ..Config::default()
+        };
+        c.skill_bundles
+            .insert("official".to_string(), SkillBundleConfig::default());
+        c.agents
+            .insert("default".to_string(), agent_with_bundles(&["official"]));
+
+        // Run the actual bin handler — no flags, so it resolves to the default
+        // agent's single assigned bundle, exactly like `zeroclaw skills install`.
+        handle_command(
+            crate::SkillCommands::Install {
+                source: source.to_string_lossy().into_owned(),
+                agent: None,
+                bundle: None,
+                no_tier_banner: true,
+                skill: None,
+            },
+            &c,
+        )
+        .await
+        .expect("skills install should succeed for a local source");
+
+        // The runtime loader must now see what install just wrote.
+        let loaded: Vec<String> = load_skills_for_agent_from_config(&c, "default")
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            loaded.iter().any(|n| n == "e2e-skill"),
+            "an installed skill must be loaded by the runtime; got {loaded:?}"
+        );
+    }
+}

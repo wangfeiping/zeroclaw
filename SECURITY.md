@@ -2,9 +2,18 @@
 
 ## Supported Versions
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 0.1.x   | :white_check_mark: |
+Security fixes ship on the latest release line only. There are no maintenance
+branches, and earlier minor versions do not receive backported fixes.
+
+| Version                    | Supported          |
+| -------------------------- | ------------------ |
+| Latest released minor line | :white_check_mark: |
+| Earlier minor lines        | :x:                |
+
+For example, if the latest release is `0.8.6`, the supported minor line is `0.8.x`; `0.7.x` and older lines are unsupported.
+
+Upgrade to the latest release before reporting. If the issue still reproduces
+there, report it as described below.
 
 ## Reporting a Vulnerability
 
@@ -13,7 +22,7 @@
 Instead, please report them responsibly:
 
 1. **Email**: Send details to the maintainers via GitHub private vulnerability reporting
-2. **GitHub**: Use [GitHub Security Advisories](https://github.com/theonlyhennygod/zeroclaw/security/advisories/new)
+2. **GitHub**: Use [GitHub Security Advisories](https://github.com/zeroclaw-labs/zeroclaw/security/advisories/new)
 
 ### What to Include
 
@@ -69,7 +78,7 @@ ZeroClaw Docker images follow CIS Docker Benchmark best practices:
 | Control | Implementation |
 |---------|----------------|
 | **4.1 Non-root user** | Container runs as UID 65534 (distroless nonroot) |
-| **4.2 Minimal base image** | `gcr.io/distroless/cc-debian12:nonroot` — no shell, no package manager |
+| **4.2 Minimal base image** | `gcr.io/distroless/cc-debian13:nonroot` — no shell, no package manager |
 | **4.6 HEALTHCHECK** | Not applicable (stateless CLI/gateway) |
 | **5.25 Read-only filesystem** | Supported via `docker run --read-only` with `/workspace` volume |
 
@@ -87,7 +96,4 @@ docker run --read-only -v /path/to/workspace:/workspace zeroclaw gateway
 
 ### CI Enforcement
 
-The `docker` job in `.github/workflows/ci.yml` automatically verifies:
-1. Container does not run as root (UID 0)
-2. Runtime stage uses `:nonroot` variant
-3. Explicit `USER` directive with numeric UID exists
+The `source-images` job in `.github/workflows/docker-image-pr.yml` verifies that its loaded default and Alpine `linux/amd64` images are configured to run as `65534:65534`.
