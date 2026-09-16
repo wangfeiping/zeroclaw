@@ -1162,12 +1162,18 @@ impl Channel for DiscordChannel {
 
                     // Skip messages from the bot itself
                     let author_id = d.get("author").and_then(|a| a.get("id")).and_then(|i| i.as_str()).unwrap_or("");
+                    let msg_guild_id = d.get("guild_id").and_then(|g| g.as_str());
+                    let content_len = d.get("content").and_then(|c| c.as_str()).map(str::len).unwrap_or(0);
+                    tracing::info!(
+                        "Discord: MESSAGE_CREATE received author={author_id} guild={msg_guild_id:?} content_len={content_len}"
+                    );
                     if author_id == bot_user_id {
                         continue;
                     }
 
                     // Skip bot messages (unless listen_to_bots is enabled)
                     if !self.listen_to_bots && d.get("author").and_then(|a| a.get("bot")).and_then(serde_json::Value::as_bool).unwrap_or(false) {
+                        tracing::info!("Discord: ignoring message from bot account (listen_to_bots=false)");
                         continue;
                     }
 
@@ -1183,6 +1189,9 @@ impl Channel for DiscordChannel {
                         // DMs have no guild_id — let them through; for guild messages, enforce the filter
                         if let Some(g) = msg_guild
                             && g != gid {
+                                tracing::info!(
+                                    "Discord: ignoring message from guild {g} (guild_id filter set to {gid})"
+                                );
                                 continue;
                             }
                     }
@@ -1196,6 +1205,9 @@ impl Channel for DiscordChannel {
                     let Some(clean_content) =
                         normalize_incoming_content(content, effective_mention_only, &bot_user_id)
                     else {
+                        tracing::info!(
+                            "Discord: message dropped by normalize_incoming_content (empty content, or mention_only=true and no @mention found) is_dm={is_dm} mention_only={effective_mention_only}"
+                        );
                         continue;
                     };
 
