@@ -95,6 +95,8 @@ context_window = 128000
 [channels.discord.discord]
 bot_token = "bot_token加密密文 enc2:..."
 enabled = true
+# 服务器里谁都能发消息，但只在被 @ 时才回复、避免打扰其他人聊天
+mention_only = true
 
 [peer_groups.owner]                                                                                                                                                         
 channel = "discord"                                                                                                                                                         
