@@ -1,0 +1,120 @@
+schema_version = 3
+
+[providers]
+
+[providers.models]
+
+[providers.models.moonshot]
+
+[providers.models.moonshot.kimi]
+api_key = "enc2:f8b7946aa67fd8154aee0b6c5c380ac95ef885ffe07be4e8080582f4a843cc2f27008f4843e18cb5de0f09d4af1aaa7fde7d5f8fc73523e0910bbf8d9777e6ed4ed1af294cf60619338f4c325cc3aac4c357feab9425c80f7d605ffea9137f08b5076b83"
+model = "k3"
+endpoint = "code"
+context_window = 128000
+
+[agents]
+
+[agents.devbot]
+model_provider = "moonshot.kimi"
+runtime_profile = "unbounded"
+risk_profile = "yolo"
+channels = ["discord.discord"]
+mcp_bundles = ["comfy"]
+
+[memory]
+backend = "sqlite.sqlite"
+
+[runtime_profiles]
+
+[runtime_profiles.unbounded]
+agentic = true
+agentic_timeout_secs = 1800
+compact_context = false
+delegation_timeout_secs = 900
+keep_tool_context_turns = 8
+max_actions_per_hour = 4294967295
+max_context_tokens = 128000
+max_cost_per_day_cents = 4294967295
+max_delegation_depth = 8
+max_history_messages = 200
+max_system_prompt_chars = 64000
+max_tool_iterations = 100
+max_tool_result_chars = 64000
+memory_recall_limit = 10
+parallel_tools = true
+shell_timeout_secs = 600
+strict_tool_parsing = false
+
+[risk_profiles.yolo]
+allowed_commands = ["*"]
+auto_approve = ["*"]
+block_high_risk_commands = false
+level = "full"
+require_approval_for_medium_risk = false
+sandbox_enabled = false
+workspace_only = false
+
+[runtime_profiles.unbounded.context_compression]
+enabled = false
+identifier_policy = "strict"
+max_passes = 3
+protect_first_n = 3
+protect_last_n = 4
+source_max_chars = 50000
+summary_max_chars = 4000
+threshold_ratio = 0.5
+timeout_secs = 60
+tool_result_retrim_chars = 2000
+
+[risk_profiles.yolo.delegation_policy]
+mode = "allow"
+
+[channels]
+
+[channels.discord]
+
+[channels.discord.discord]
+enabled = true
+bot_token = "enc2:a3d5b8fbb6bbe2918a9e8191b81d1a9c2ae0615e4e31fa3534ce272d98237690f9d0808fc8695192578fe505cbeb5bdab31eab327332da25e3099549bfa9f11b19ee64e0f7aca2cd54615eb6a630dc01d9cceb909bd6c03b9dbb04f92f54cad7c0064f54"
+mention_only = true          # 只处理 @机器人 的消息
+ 
+[peer_groups]
+
+[peer_groups.discord_discord_default]
+channel = "discord.discord"
+external_peers = ["*"]       # 任何人都可以触发
+
+[runtime_profiles.unbounded.eval]
+enabled = false
+max_retries = 1
+min_quality_score = 0.5
+
+[runtime_profiles.unbounded.history_pruning]
+collapse_tool_results = true
+enabled = false
+keep_recent = 4
+max_tokens = 8192
+
+[runtime_profiles.unbounded.thinking]
+default_level = "medium"
+display = "off"
+native_thinking = false
+
+[runtime_profiles.unbounded.tool_receipts]
+enabled = false
+inject_system_prompt = true
+show_in_response = false
+
+[onboard_state]
+quickstart_completed = true
+
+[risk_profiles]
+
+[[mcp.servers]]
+name = "comfyui"
+command = "docker"
+args = ["exec", "-i", "comfyui", "comfy-mcp"]
+tool_timeout_secs = 600
+
+[mcp_bundles.comfy]
+servers = ["comfyui"]
