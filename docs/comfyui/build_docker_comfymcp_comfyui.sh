@@ -7,7 +7,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-IMAGE_NAME="${IMAGE_NAME:-comfyui-comfymcp}"
+IMAGE_NAME="${IMAGE_NAME:-comfyui-max}"
 IMAGE_TAG="${IMAGE_TAG:-$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' comfyui_version.py)}"
 TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}"
 
