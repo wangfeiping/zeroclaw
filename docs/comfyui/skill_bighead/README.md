@@ -63,6 +63,28 @@ systemctl --user restart zeroclaw
 先单独测上传脚本(不扣费):
 
 ```sh
+# small images
+# ┌───────┬─────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │ 宽度  │ 大  │                                                                                  链接                                                                                   │
+  │       │ 小  │                                                                                                                                                                         │
+  ├───────┼─────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 1280p │ 约  │ https://upload.wikimedia.org/wikipedia/commons/thumb/e/ec/Mona_Lisa%2C_by_Leonardo_da_Vinci%2C_from_C2RMF_retouched.jpg/1280px-Mona_Lisa%2C_by_Leonardo_da_Vinci%2C_fro │
+  │ x     │ 957 │ m_C2RMF_retouched.jpg                                                                                                                                                   │
+  │       │  KB │                                                                                                                                                                         │
+  ├───────┼─────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │       │ 约  │ https://upload.wikimedia.org/wikipedia/commons/thumb/e/ec/Mona_Lisa%2C_by_Leonardo_da_Vinci%2C_from_C2RMF_retouched.jpg/960px-Mona_Lisa%2C_by_Leonardo_da_Vinci%2C_from │
+  │ 960px │ 505 │ _C2RMF_retouched.jpg                                                                                                                                                    │
+  │       │  KB │                                                                                                                                                                         │
+  ├───────┼─────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │       │ 约  │ https://upload.wikimedia.org/wikipedia/commons/thumb/e/ec/Mona_Lisa%2C_by_Leonardo_da_Vinci%2C_from_C2RMF_retouched.jpg/500px-Mona_Lisa%2C_by_Leonardo_da_Vinci%2C_from │
+  │ 500px │ 115 │ _C2RMF_retouched.jpg                                                                                                                                                    │
+  │       │  KB │                                                                                                                                                                         │
+  └───────┴─────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+#
+#
+# https://upload.wikimedia.org/wikipedia/commons/thumb/e/ec/Mona_Lisa%2C_by_Leonardo_da_Vinci%2C_from_C2RMF_retouched.jpg/500px-Mona_Lisa%2C_by_Leonardo_da_Vinci%2C_from_C2RMF_retouched.jpg
+#
+
 cd ~/.zeroclaw/agents/devbot/workspace
 python3 skills/bighead/scripts/upload.py /path/to/selfie.jpg \
   "https://upload.wikimedia.org/wikipedia/commons/e/ec/Mona_Lisa%2C_by_Leonardo_da_Vinci%2C_from_C2RMF_retouched.jpg"
@@ -116,3 +138,31 @@ skill 规定:每次请求只生成一张;API 报错最多同参数重试一次;�
 - 已验证:上传脚本对本地 PNG(3000×1000)、维基百科原图 URL(约 90 MB 的蒙娜丽莎)都能拿到 URL;
   非图片文件、不存在的文件、无法解析的域名、容器名错误都返回 `BIGHEAD_ERROR`;容器内临时文件会清理;
   `zeroclaw skills audit` 通过。
+
+## Error
+
+### Discord 中没有 /bighead 命令
+
+```text
+# ~/.zeroclaw/config.toml 里的 [channels.discord.discord] 需要开启 slash_commands。
+
+  - 这个开关默认是 false，关着的时候 ZeroClaw 一个斜杠命令都不注册，不只是缺 /bighead，
+  - 连内置的 /ask 也没有；
+ 
+# 修复
+ 
+  在 ~/.zeroclaw/config.toml 的 [channels.discord.discord] 下面加三行：
+
+  [channels.discord.discord]
+  enabled = true
+  bot_token = "..."
+  mention_only = true
+  slash_commands = true             # 开启斜杠命令
+  slash_command_scope = "guild"     # 只注册到指定服务器，马上生效
+  guild_ids = ["<你的服务器 ID>"]   # 填你的服务器 ID
+
+  - 服务器 ID 怎么拿： 在 Discord 设置 → 高级里打开"开发者模式"，然后右键服务器图标 →"复制服务器 ID"。
+  - 能不能不填 guild_ids： 可以，不填会注册成全局命令，但全局命令最多要约 1 小时才会出现。测试的时候用 guild 更方便。
+
+```
+
